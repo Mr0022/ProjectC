@@ -7,6 +7,7 @@ import torch.nn as nn
 from torch import optim
 import os
 import time
+import math
 import warnings
 import numpy as np
 from utils.dtw_metric import dtw, accelerated_dtw
@@ -20,11 +21,39 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         super(Exp_Long_Term_Forecast, self).__init__(args)
 
     def _build_model(self):
-        model = self.model_dict[self.args.model](self.args).float()
+        # Mean-aggregation (Option 1): the model forecasts a SINGLE value -- the
+        # log of the horizon-average variance, log(mean(RV)). Build the head with
+        # target_window=1 by temporarily setting pred_len=1, then restore the
+        # original pred_len so the data loader still returns the full future
+        # window (needed to build the ground-truth mean in _get_target).
+        if getattr(self.args, 'aggregate_mean', False):
+            orig_pred_len = self.args.pred_len
+            self.args.pred_len = 1
+            model = self.model_dict[self.args.model](self.args).float()
+            self.args.pred_len = orig_pred_len
+        else:
+            model = self.model_dict[self.args.model](self.args).float()
 
         if self.args.use_multi_gpu and self.args.use_gpu:
             model = nn.DataParallel(model, device_ids=self.args.device_ids)
         return model
+
+    def _get_target(self, batch_y, f_dim):
+        """Slice the future window and, if aggregating, reduce it to the Option-1
+        target log(mean(RV)) over the horizon.
+
+        The input/target series is ln_RV, so RV = exp(ln_RV) and
+            log(mean(RV)) = logsumexp(ln_RV) - log(h)
+        which aggregates in variance space (the additive, economically correct
+        space) while staying numerically stable. If the dataset also exposes a
+        raw ``RV`` future window (data has a separate RV column), that is used
+        directly instead of exp(ln_RV)."""
+        y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+        if getattr(self.args, 'aggregate_mean', False):
+            h = y.shape[1]
+            # log(mean(exp(ln_RV))) == logsumexp(ln_RV) - log(h)
+            y = torch.logsumexp(y, dim=1, keepdim=True) - math.log(h)
+        return y
 
     def _get_data(self, flag):
         data_set, data_loader = data_provider(self.args, flag)
@@ -61,7 +90,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                batch_y = self._get_target(batch_y, f_dim)
 
                 pred = outputs.detach()
                 true = batch_y.detach()
@@ -118,7 +147,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                         f_dim = -1 if self.args.features == 'MS' else 0
                         outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                        batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                        batch_y = self._get_target(batch_y, f_dim)
                         loss = criterion(outputs, batch_y)
                         train_loss.append(loss.item())
                 else:
@@ -126,7 +155,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                     f_dim = -1 if self.args.features == 'MS' else 0
                     outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                    batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                    batch_y = self._get_target(batch_y, f_dim)
                     loss = criterion(outputs, batch_y)
                     train_loss.append(loss.item())
 
@@ -197,19 +226,27 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
                 f_dim = -1 if self.args.features == 'MS' else 0
-                outputs = outputs[:, -self.args.pred_len:, :]
-                batch_y = batch_y[:, -self.args.pred_len:, :].to(self.device)
-                outputs = outputs.detach().cpu().numpy()
-                batch_y = batch_y.detach().cpu().numpy()
-                if test_data.scale and self.args.inverse:
-                    shape = batch_y.shape
-                    if outputs.shape[-1] != batch_y.shape[-1]:
-                        outputs = np.tile(outputs, [1, 1, int(batch_y.shape[-1] / outputs.shape[-1])])
-                    outputs = test_data.inverse_transform(outputs.reshape(shape[0] * shape[1], -1)).reshape(shape)
-                    batch_y = test_data.inverse_transform(batch_y.reshape(shape[0] * shape[1], -1)).reshape(shape)
+                if getattr(self.args, 'aggregate_mean', False):
+                    # single-value forecast vs log(mean(RV)) target; no inverse
+                    # transform (aggregated target is not in the scaler's space)
+                    outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                    batch_y = self._get_target(batch_y, f_dim)
+                    outputs = outputs.detach().cpu().numpy()
+                    batch_y = batch_y.detach().cpu().numpy()
+                else:
+                    outputs = outputs[:, -self.args.pred_len:, :]
+                    batch_y = batch_y[:, -self.args.pred_len:, :].to(self.device)
+                    outputs = outputs.detach().cpu().numpy()
+                    batch_y = batch_y.detach().cpu().numpy()
+                    if test_data.scale and self.args.inverse:
+                        shape = batch_y.shape
+                        if outputs.shape[-1] != batch_y.shape[-1]:
+                            outputs = np.tile(outputs, [1, 1, int(batch_y.shape[-1] / outputs.shape[-1])])
+                        outputs = test_data.inverse_transform(outputs.reshape(shape[0] * shape[1], -1)).reshape(shape)
+                        batch_y = test_data.inverse_transform(batch_y.reshape(shape[0] * shape[1], -1)).reshape(shape)
 
-                outputs = outputs[:, :, f_dim:]
-                batch_y = batch_y[:, :, f_dim:]
+                    outputs = outputs[:, :, f_dim:]
+                    batch_y = batch_y[:, :, f_dim:]
 
                 pred = outputs
                 true = batch_y
