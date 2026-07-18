@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# 1-epoch smoke test for all 10 supported long-term-forecasting models on the
+# 1-epoch smoke test for all 11 supported long-term-forecasting models on the
 # realized-volatility dataset (data/realized_volatility.csv, univariate ln_RV).
 #
 # Models: DLinear, PatchTST, iTransformer, TimesNet, MSGNet, TimeMixer,
-#         FITS, WFTNet, TSLANet, ModernTCN
+#         FITS, WFTNet, TSLANet, ModernTCN, AdaWaveNet
 #
 # Runs on CPU by default (drop --no_use_gpu to use CUDA). Each run trains for a
 # single epoch and prints the test MSE/MAE — this is a wiring check, not a
@@ -38,3 +38,4 @@ run_one FITS
 run_one WFTNet --e_layers 1
 run_one TSLANet
 run_one ModernTCN
+run_one AdaWaveNet --lifting_levels 3 --lifting_kernel_size 7 --n_clusters 4

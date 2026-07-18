@@ -154,6 +154,15 @@ if __name__ == '__main__':
     parser.add_argument('--period_coeff', type=float, default=0.5,
                         help='WFTNet weight balancing wavelet vs fourier branch')
 
+    # AdaWaveNet (adaptive lifting-scheme wavelet network)
+    parser.add_argument('--lifting_kernel_size', type=int, default=7, help='conv kernel size of lifting scheme')
+    parser.add_argument('--lifting_levels', type=int, default=1, help='levels of lifting scheme')
+    parser.add_argument('--regu_details', type=float, default=0.01, help='regu_details of lifting scheme')
+    parser.add_argument('--regu_approx', type=float, default=0.01, help='regu_approx of lifting scheme')
+    parser.add_argument('--n_clusters', type=int, default=4, help='number of channel clusters for AdaWaveNet')
+    parser.add_argument('--sr_ratio', type=int, default=10, help='super resolution ratio (AdaWaveNet)')
+    parser.add_argument('--output_attention', action='store_true', help='whether to output attention in encoder')
+
     # GCN
     parser.add_argument('--node_dim', type=int, default=10, help='each node embbed to dim dimentions')
     parser.add_argument('--gcn_depth', type=int, default=2, help='')

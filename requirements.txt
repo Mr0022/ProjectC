@@ -11,6 +11,8 @@ sktime==0.40.1
 sympy==1.13.1
 PyWavelets==1.9.0
 ptwt==1.0.1
+fast_pytorch_kmeans==0.2.2
+psutil
 datasets==4.5.0
 
 tqdm==4.66.5
