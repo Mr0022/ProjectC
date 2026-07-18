@@ -140,6 +140,20 @@ if __name__ == '__main__':
     # TimeXer
     parser.add_argument('--patch_len', type=int, default=16, help='patch length')
 
+    # Patch-based conv models (ModernTCN / TSLANet)
+    parser.add_argument('--patch_size', type=int, default=16, help='patch size for ModernTCN/TSLANet')
+    parser.add_argument('--patch_stride', type=int, default=8, help='patch stride for ModernTCN')
+    parser.add_argument('--head_dropout', type=float, default=0.0, help='head dropout for ModernTCN')
+
+    # FITS
+    parser.add_argument('--cut_freq', type=int, default=0,
+                        help='FITS low-pass cutoff (num of retained freq bins); 0 = auto')
+
+    # WFTNet
+    parser.add_argument('--wavelet_scale', type=int, default=4, help='WFTNet CWT scale')
+    parser.add_argument('--period_coeff', type=float, default=0.5,
+                        help='WFTNet weight balancing wavelet vs fourier branch')
+
     # GCN
     parser.add_argument('--node_dim', type=int, default=10, help='each node embbed to dim dimentions')
     parser.add_argument('--gcn_depth', type=int, default=2, help='')

@@ -1,29 +1,24 @@
 import os
 import numpy as np
 import pandas as pd
-import glob
-import re
+import os
 import torch
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 from utils.timefeatures import time_features
-from data_provider.m4 import M4Dataset, M4Meta
-from data_provider.uea import subsample, interpolate_missing, Normalizer
-from sktime.datasets import load_from_tsfile_to_dataframe
 import warnings
-from utils.augmentation import run_augmentation_single
-from datasets import load_dataset
-from huggingface_hub import hf_hub_download
+
 warnings.filterwarnings('ignore')
 
-HUGGINGFACE_REPO = "thuml/Time-Series-Library"
 
-class Dataset_ETT_hour(Dataset):
-    def __init__(self, args, root_path, flag='train', size=None,
+
+
+
+class Dataset_Custom(Dataset):
+    def __init__(self, root_path, flag='train', size=None,
                  features='S', data_path='ETTh1.csv',
-                 target='OT', scale=True, timeenc=0, freq='h', seasonal_patterns=None):
+                 target='OT', scale=False, timeenc=0, freq='h'):
         # size [seq_len, label_len, pred_len]
-        self.args = args
         # info
         if size == None:
             self.seq_len = 24 * 4 * 4
@@ -50,18 +45,26 @@ class Dataset_ETT_hour(Dataset):
 
     def __read_data__(self):
         self.scaler = StandardScaler()
+        df_raw = pd.read_csv(os.path.join(self.root_path,
+                                          self.data_path))
+        # guard against blank/incomplete trailing rows (e.g. Excel exports):
+        # NaN targets would silently poison windows and test metrics
+        df_raw = df_raw.dropna(subset=['date', self.target]).reset_index(drop=True)
 
-        local_fp = os.path.join(self.root_path, self.data_path)
-        cfg_name = os.path.splitext(os.path.basename(self.data_path))[0]
+        '''
+        df_raw.columns: ['date', ...(other features), target feature]
+        '''
+        cols = list(df_raw.columns)
+        cols.remove(self.target)
+        cols.remove('date')
+        df_raw = df_raw[['date'] + cols + [self.target]]
 
-        if os.path.exists(local_fp):
-            df_raw = pd.read_csv(local_fp)
-        else:
-            ds = load_dataset(HUGGINGFACE_REPO, name=cfg_name)
-            df_raw = ds["train"].to_pandas()
-            
-        border1s = [0, 12 * 30 * 24 - self.seq_len, 12 * 30 * 24 + 4 * 30 * 24 - self.seq_len]
-        border2s = [12 * 30 * 24, 12 * 30 * 24 + 4 * 30 * 24, 12 * 30 * 24 + 8 * 30 * 24]
+        df_raw['date'] = pd.to_datetime(df_raw['date'])
+        # train: 2010-2021, val: 2022-2023, test: 2024-2025
+        train_end = int((df_raw['date'].dt.year <= 2021).sum())
+        val_end = int((df_raw['date'].dt.year <= 2023).sum())
+        border1s = [0, train_end - self.seq_len, val_end - self.seq_len]
+        border2s = [train_end, val_end, len(df_raw)]
         border1 = border1s[self.set_type]
         border2 = border2s[self.set_type]
 
@@ -78,8 +81,7 @@ class Dataset_ETT_hour(Dataset):
         else:
             data = df_data.values
 
-        df_stamp = df_raw[['date']][border1:border2]
-        df_stamp['date'] = pd.to_datetime(df_stamp.date)
+        df_stamp = df_raw[['date']][border1:border2].copy()
         if self.timeenc == 0:
             df_stamp['month'] = df_stamp.date.apply(lambda row: row.month, 1)
             df_stamp['day'] = df_stamp.date.apply(lambda row: row.day, 1)
@@ -88,14 +90,10 @@ class Dataset_ETT_hour(Dataset):
             data_stamp = df_stamp.drop(['date'], 1).values
         elif self.timeenc == 1:
             data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=self.freq)
-            data_stamp = data_stamp.transpose(1, 0) 
+            data_stamp = data_stamp.transpose(1, 0)
 
         self.data_x = data[border1:border2]
         self.data_y = data[border1:border2]
-
-        if self.set_type == 0 and self.args.augmentation_ratio > 0:
-            self.data_x, self.data_y, augmentation_tags = run_augmentation_single(self.data_x, self.data_y, self.args)
-
         self.data_stamp = data_stamp
 
     def __getitem__(self, index):
@@ -116,14 +114,89 @@ class Dataset_ETT_hour(Dataset):
 
     def inverse_transform(self, data):
         return self.scaler.inverse_transform(data)
+    
+
+class Dataset_Custom_Events(Dataset_Custom):
+    """
+    Dataset_Custom + a daily macro news-event calendar (data/events.csv).
+
+    The event file must contain a 'date' column plus numeric per-day event
+    features (multi-hot 'evt_*' indicator columns and 'n_events*' counts).
+    Rows are aligned to the target CSV's trading dates by date; days missing
+    from the event file are treated as no-event days (all zeros).
+
+    'evt_*' indicator columns are kept raw (0/1). All other event columns
+    (counts) are standardised with statistics from the TRAIN years only,
+    mirroring how the target series is scaled.
+
+    __getitem__ additionally returns:
+        seq_x_events : (seq_len,  n_event_features)  events on the look-back days
+        seq_y_events : (pred_len, n_event_features)  the KNOWN event schedule for
+                                                     the pred_len forecast days
+    Both are what is known at the forecast origin: the future window encodes
+    only that an event is scheduled (release calendar), never its outcome.
+    """
+
+    def __init__(self, root_path, flag='train', size=None,
+                 features='S', data_path='realized_volatility.csv',
+                 target='ln_RV', scale=False, timeenc=0, freq='h',
+                 event_path='events.csv'):
+        self.event_path = event_path
+        super().__init__(root_path=root_path, flag=flag, size=size,
+                         features=features, data_path=data_path,
+                         target=target, scale=scale, timeenc=timeenc, freq=freq)
+
+    def __read_data__(self):
+        super().__read_data__()
+
+        # re-read and filter exactly like Dataset_Custom so row indices align
+        df_raw = pd.read_csv(os.path.join(self.root_path, self.data_path))
+        df_raw = df_raw.dropna(subset=['date', self.target]).reset_index(drop=True)
+        df_raw['date'] = pd.to_datetime(df_raw['date'])
+
+        df_ev = pd.read_csv(os.path.join(self.root_path, self.event_path))
+        df_ev['date'] = pd.to_datetime(df_ev['date'])
+        ev_cols = [c for c in df_ev.columns if c != 'date']
+
+        # align event rows to the trading dates of the target series;
+        # dates absent from the event file become all-zero (no-event) days
+        df_ev = df_ev.drop_duplicates(subset='date').set_index('date')
+        events = df_ev.reindex(df_raw['date']).fillna(0.0)[ev_cols].values.astype(np.float32)
+
+        # standardise count columns on the TRAIN years only; keep evt_* binary
+        train_end = int((df_raw['date'].dt.year <= 2021).sum())
+        count_idx = [i for i, c in enumerate(ev_cols) if not c.startswith('evt_')]
+        if count_idx:
+            tr = events[:train_end, count_idx]
+            mean, std = tr.mean(axis=0), tr.std(axis=0) + 1e-8
+            events[:, count_idx] = (events[:, count_idx] - mean) / std
+
+        self.event_cols = ev_cols
+        self.n_event_features = events.shape[1]
+        # slice with the same borders as data_x/data_y so indices line up
+        val_end = int((df_raw['date'].dt.year <= 2023).sum())
+        border1s = [0, train_end - self.seq_len, val_end - self.seq_len]
+        border2s = [train_end, val_end, len(df_raw)]
+        border1 = border1s[self.set_type]
+        border2 = border2s[self.set_type]
+        self.data_events = events[border1:border2]
+
+    def __getitem__(self, index):
+        seq_x, seq_y, seq_x_mark, seq_y_mark = super().__getitem__(index)
+
+        s_begin = index
+        s_end = s_begin + self.seq_len
+        seq_x_events = self.data_events[s_begin:s_end]
+        seq_y_events = self.data_events[s_end:s_end + self.pred_len]
+
+        return seq_x, seq_y, seq_x_mark, seq_y_mark, seq_x_events, seq_y_events
 
 
-class Dataset_ETT_minute(Dataset):
-    def __init__(self, args, root_path, flag='train', size=None,
-                 features='S', data_path='ETTm1.csv',
-                 target='OT', scale=True, timeenc=0, freq='t', seasonal_patterns=None):
+class Dataset_Pred(Dataset):
+    def __init__(self, root_path, flag='pred', size=None,
+                 features='S', data_path='ETTh1.csv',
+                 target='OT', scale=True, inverse=False, timeenc=0, freq='15min', cols=None):
         # size [seq_len, label_len, pred_len]
-        self.args = args
         # info
         if size == None:
             self.seq_len = 24 * 4 * 4
@@ -134,36 +207,36 @@ class Dataset_ETT_minute(Dataset):
             self.label_len = size[1]
             self.pred_len = size[2]
         # init
-        assert flag in ['train', 'test', 'val']
-        type_map = {'train': 0, 'val': 1, 'test': 2}
-        self.set_type = type_map[flag]
+        assert flag in ['pred']
 
         self.features = features
         self.target = target
         self.scale = scale
+        self.inverse = inverse
         self.timeenc = timeenc
         self.freq = freq
-
+        self.cols = cols
         self.root_path = root_path
         self.data_path = data_path
         self.__read_data__()
 
     def __read_data__(self):
         self.scaler = StandardScaler()
-        
-        local_fp = os.path.join(self.root_path, self.data_path)
-        cfg_name = os.path.splitext(os.path.basename(self.data_path))[0]
-
-        if os.path.exists(local_fp):
-            df_raw = pd.read_csv(local_fp)
+        df_raw = pd.read_csv(os.path.join(self.root_path,
+                                          self.data_path))
+        '''
+        df_raw.columns: ['date', ...(other features), target feature]
+        '''
+        if self.cols:
+            cols = self.cols.copy()
+            cols.remove(self.target)
         else:
-            ds = load_dataset(HUGGINGFACE_REPO, name=cfg_name)
-            df_raw = ds["train"].to_pandas()
-
-        border1s = [0, 12 * 30 * 24 * 4 - self.seq_len, 12 * 30 * 24 * 4 + 4 * 30 * 24 * 4 - self.seq_len]
-        border2s = [12 * 30 * 24 * 4, 12 * 30 * 24 * 4 + 4 * 30 * 24 * 4, 12 * 30 * 24 * 4 + 8 * 30 * 24 * 4]
-        border1 = border1s[self.set_type]
-        border2 = border2s[self.set_type]
+            cols = list(df_raw.columns)
+            cols.remove(self.target)
+            cols.remove('date')
+        df_raw = df_raw[['date'] + cols + [self.target]]
+        border1 = len(df_raw) - self.seq_len
+        border2 = len(df_raw)
 
         if self.features == 'M' or self.features == 'MS':
             cols_data = df_raw.columns[1:]
@@ -172,14 +245,17 @@ class Dataset_ETT_minute(Dataset):
             df_data = df_raw[[self.target]]
 
         if self.scale:
-            train_data = df_data[border1s[0]:border2s[0]]
-            self.scaler.fit(train_data.values)
+            self.scaler.fit(df_data.values)
             data = self.scaler.transform(df_data.values)
         else:
             data = df_data.values
 
-        df_stamp = df_raw[['date']][border1:border2]
-        df_stamp['date'] = pd.to_datetime(df_stamp.date)
+        tmp_stamp = df_raw[['date']][border1:border2]
+        tmp_stamp['date'] = pd.to_datetime(tmp_stamp.date)
+        pred_dates = pd.date_range(tmp_stamp.date.values[-1], periods=self.pred_len + 1, freq=self.freq)
+
+        df_stamp = pd.DataFrame(columns=['date'])
+        df_stamp.date = list(tmp_stamp.date.values) + list(pred_dates[1:])
         if self.timeenc == 0:
             df_stamp['month'] = df_stamp.date.apply(lambda row: row.month, 1)
             df_stamp['day'] = df_stamp.date.apply(lambda row: row.day, 1)
@@ -193,11 +269,10 @@ class Dataset_ETT_minute(Dataset):
             data_stamp = data_stamp.transpose(1, 0)
 
         self.data_x = data[border1:border2]
-        self.data_y = data[border1:border2]
-
-        if self.set_type == 0 and self.args.augmentation_ratio > 0:
-            self.data_x, self.data_y, augmentation_tags = run_augmentation_single(self.data_x, self.data_y, self.args)
-
+        if self.inverse:
+            self.data_y = df_data.values[border1:border2]
+        else:
+            self.data_y = data[border1:border2]
         self.data_stamp = data_stamp
 
     def __getitem__(self, index):
@@ -207,644 +282,169 @@ class Dataset_ETT_minute(Dataset):
         r_end = r_begin + self.label_len + self.pred_len
 
         seq_x = self.data_x[s_begin:s_end]
-        seq_y = self.data_y[r_begin:r_end]
+        if self.inverse:
+            seq_y = self.data_x[r_begin:r_begin + self.label_len]
+        else:
+            seq_y = self.data_y[r_begin:r_begin + self.label_len]
         seq_x_mark = self.data_stamp[s_begin:s_end]
         seq_y_mark = self.data_stamp[r_begin:r_end]
 
         return seq_x, seq_y, seq_x_mark, seq_y_mark
 
     def __len__(self):
-        return len(self.data_x) - self.seq_len - self.pred_len + 1
+        return len(self.data_x) - self.seq_len + 1
 
     def inverse_transform(self, data):
         return self.scaler.inverse_transform(data)
 
 
-class Dataset_Custom(Dataset):
-    def __init__(self, args, root_path, flag='train', size=None,
-                 features='S', data_path='ETTh1.csv',
-                 target='OT', scale=True, timeenc=0, freq='h', seasonal_patterns=None):
-        # size [seq_len, label_len, pred_len]
-        self.args = args
-        # info
-        if size == None:
-            self.seq_len = 24 * 4 * 4
-            self.label_len = 24 * 4
-            self.pred_len = 24 * 4
+class Dataset_HAR_Residual(Dataset):
+    """
+    HAR-LSTM residual dataset (Corsi 2009 + LSTM correction).
+
+    The HAR-RV linear model is fit by OLS on the TRAINING window only
+    (2010-2021, mirroring Dataset_Custom). Its prediction of the h-day
+    forward average log-RV is removed, and the LSTM is trained to forecast
+    the HAR *residual* from a look-back window of observed ln(RV). The final
+    hybrid forecast, reconstructed at test time, is:
+
+        y_hat^(h) = HAR_pred^(h) + LSTM_residual_pred
+
+    Design notes
+    ------------
+    * Horizon h is taken from pred_len. The target Y_t^(h) is the h-day
+      forward mean of ln(RV) -- identical to the aggregate-mean target used
+      by the deep-learning baselines, so the comparison is apples-to-apples.
+    * The LSTM input window is the *observed* ln(RV) series (known at the
+      forecast origin t), so there is no look-ahead from overlapping
+      residuals.
+    * Inputs and residual targets are standardised with statistics computed
+      on the TRAIN split only; targets are de-standardised before the HAR
+      prediction is added back. RevIN is therefore unnecessary (use --revin 0).
+
+    HAR regressors (information available AT the forecast origin t, i.e.
+    including today's RV_t -- the same information set as the deep look-back
+    window, which also ends at y[t]):
+        RV_d = ln(RV_t)
+        RV_w = mean(ln(RV_t) .. ln(RV_{t-4}))
+        RV_m = mean(ln(RV_t) .. ln(RV_{t-21}))
+
+    __getitem__ returns four (1-channel) tensors:
+        seq_x        : (seq_len, 1)  standardised look-back window of ln(RV)
+        resid_target : (1, 1)        standardised HAR residual at origin t
+        har_pred     : (1, 1)        HAR linear prediction (original scale)
+        y_true       : (1, 1)        actual Y_t^(h) (original scale)
+    """
+
+    LAG_W = 5    # weekly component window
+    LAG_M = 22   # monthly component window
+
+    def __init__(self, root_path, flag='train', size=None,
+                 features='S', data_path='realized_volatility.csv',
+                 target='ln_RV', scale=True, timeenc=0, freq='d'):
+        if size is None:
+            self.seq_len, self.label_len, self.pred_len = 96, 48, 1
         else:
-            self.seq_len = size[0]
-            self.label_len = size[1]
-            self.pred_len = size[2]
-        # init
+            self.seq_len, self.label_len, self.pred_len = size
         assert flag in ['train', 'test', 'val']
-        type_map = {'train': 0, 'val': 1, 'test': 2}
-        self.set_type = type_map[flag]
+        self.set_type = {'train': 0, 'val': 1, 'test': 2}[flag]
 
         self.features = features
         self.target = target
         self.scale = scale
-        self.timeenc = timeenc
-        self.freq = freq
-
         self.root_path = root_path
         self.data_path = data_path
         self.__read_data__()
 
     def __read_data__(self):
-        self.scaler = StandardScaler()
-        local_fp = os.path.join(self.root_path, self.data_path)
-        cfg_name = os.path.splitext(os.path.basename(self.data_path))[0]
+        h = self.pred_len  # forecast horizon (steps ahead)
 
-        if os.path.exists(local_fp):
-            df_raw = pd.read_csv(local_fp)
+        df_raw = pd.read_csv(os.path.join(self.root_path, self.data_path))
+        date_col = 'date' if 'date' in df_raw.columns else df_raw.columns[0]
+        df_raw[date_col] = pd.to_datetime(df_raw[date_col])
+        df_raw = df_raw.sort_values(date_col).reset_index(drop=True)
+
+        if self.target in df_raw.columns:
+            val_col = self.target
+        elif 'ln_RV' in df_raw.columns:
+            val_col = 'ln_RV'
         else:
-            ds = load_dataset(HUGGINGFACE_REPO, name=cfg_name)
-            split_name = "train" if "train" in ds else list(ds.keys())[0]
-            df_raw = ds[split_name].to_pandas()
+            val_col = df_raw.select_dtypes('number').columns[0]
+        y = df_raw[val_col].astype(float).values
+        N = len(y)
 
-        '''
-        df_raw.columns: ['date', ...(other features), target feature]
-        '''
-        cols = list(df_raw.columns)
-        cols.remove(self.target)
-        cols.remove('date')
-        df_raw = df_raw[['date'] + cols + [self.target]]
-        num_train = int(len(df_raw) * 0.7)
-        num_test = int(len(df_raw) * 0.2)
-        num_vali = len(df_raw) - num_train - num_test
-        border1s = [0, num_train - self.seq_len, len(df_raw) - num_test - self.seq_len]
-        border2s = [num_train, num_train + num_vali, len(df_raw)]
-        border1 = border1s[self.set_type]
-        border2 = border2s[self.set_type]
+        # ── HAR regressors (info AT origin t => include today's RV_t) ────────
+        #    This matches the deep look-back window, which also ends at y[t],
+        #    so the HAR linear part and the residual learner share one
+        #    information set (Corsi 2009 convention; no look-ahead).
+        s = pd.Series(y)
+        RV_d = s.values
+        RV_w = s.rolling(self.LAG_W).mean().values
+        RV_m = s.rolling(self.LAG_M).mean().values
 
-        if self.features == 'M' or self.features == 'MS':
-            cols_data = df_raw.columns[1:]
-            df_data = df_raw[cols_data]
-        elif self.features == 'S':
-            df_data = df_raw[[self.target]]
+        # ── Horizon target Y_t^(h) = mean(ln_RV[t+1 .. t+h]) ─────────────────
+        Yh = s.rolling(h).mean().shift(-h).values
 
+        # ── Split borders (mirror Dataset_Custom; val kept separate) ─────────
+        years = df_raw[date_col].dt.year.values
+        train_end = int((years <= 2021).sum())
+        val_end = int((years <= 2023).sum())
+        border1s = [0, train_end - self.seq_len, val_end - self.seq_len]
+        border2s = [train_end, val_end, N]
+
+        feat_valid = (~np.isnan(RV_d)) & (~np.isnan(RV_w)) & (~np.isnan(RV_m))
+
+        # ── Fit HAR-RV by OLS on the TRAIN window only (2010-2021) ───────────
+        train_mask = np.zeros(N, dtype=bool)
+        train_mask[:train_end] = True
+        fit_mask = train_mask & feat_valid & (~np.isnan(Yh))
+        X_all = np.column_stack([np.ones(N), RV_d, RV_w, RV_m])
+        beta, *_ = np.linalg.lstsq(X_all[fit_mask], Yh[fit_mask], rcond=None)
+        self.har_beta = beta  # [const, b_d, b_w, b_m]
+
+        har_pred = X_all @ beta
+        har_pred[~feat_valid] = np.nan
+        resid = Yh - har_pred
+
+        # ── Standardisation statistics from TRAIN split only ─────────────────
         if self.scale:
-            train_data = df_data[border1s[0]:border2s[0]]
-            self.scaler.fit(train_data.values)
-            data = self.scaler.transform(df_data.values)
+            x_tr = y[:train_end]
+            self.x_mean, self.x_std = float(np.mean(x_tr)), float(np.std(x_tr) + 1e-8)
+            r_tr = resid[fit_mask]
+            self.r_mean, self.r_std = float(np.mean(r_tr)), float(np.std(r_tr) + 1e-8)
         else:
-            data = df_data.values
+            self.x_mean, self.x_std = 0.0, 1.0
+            self.r_mean, self.r_std = 0.0, 1.0
 
-        df_stamp = df_raw[['date']][border1:border2]
-        df_stamp['date'] = pd.to_datetime(df_stamp.date)
-        if self.timeenc == 0:
-            df_stamp['month'] = df_stamp.date.apply(lambda row: row.month, 1)
-            df_stamp['day'] = df_stamp.date.apply(lambda row: row.day, 1)
-            df_stamp['weekday'] = df_stamp.date.apply(lambda row: row.weekday(), 1)
-            df_stamp['hour'] = df_stamp.date.apply(lambda row: row.hour, 1)
-            data_stamp = df_stamp.drop(['date'], 1).values
-        elif self.timeenc == 1:
-            data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=self.freq)
-            data_stamp = data_stamp.transpose(1, 0)
+        # ── Materialise windowed samples for the requested split ─────────────
+        b1, b2 = border1s[self.set_type], border2s[self.set_type]
+        seqx, rtar, hpred, ytrue, idxs = [], [], [], [], []
+        first_origin = b1 + self.seq_len - 1
+        for g in range(first_origin, b2):
+            if g - self.seq_len + 1 < 0:
+                continue
+            if np.isnan(resid[g]) or np.isnan(har_pred[g]) or np.isnan(Yh[g]):
+                continue
+            window = (y[g - self.seq_len + 1: g + 1] - self.x_mean) / self.x_std
+            seqx.append(window.reshape(self.seq_len, 1))
+            rtar.append([[(resid[g] - self.r_mean) / self.r_std]])
+            hpred.append([[har_pred[g]]])
+            ytrue.append([[Yh[g]]])
+            idxs.append(g)
 
-        self.data_x = data[border1:border2]
-        self.data_y = data[border1:border2]
+        self.seq_x = np.asarray(seqx, dtype=np.float32)
+        self.resid = np.asarray(rtar, dtype=np.float32)
+        self.har = np.asarray(hpred, dtype=np.float32)
+        self.ytrue = np.asarray(ytrue, dtype=np.float32)
+        self.origin_idx = np.asarray(idxs)
+        self.dates = df_raw[date_col].values
 
-        if self.set_type == 0 and self.args.augmentation_ratio > 0:
-            self.data_x, self.data_y, augmentation_tags = run_augmentation_single(self.data_x, self.data_y, self.args)
-
-        self.data_stamp = data_stamp
-
-    def __getitem__(self, index):
-        s_begin = index
-        s_end = s_begin + self.seq_len
-        r_begin = s_end - self.label_len
-        r_end = r_begin + self.label_len + self.pred_len
-
-        seq_x = self.data_x[s_begin:s_end]
-        seq_y = self.data_y[r_begin:r_end]
-        seq_x_mark = self.data_stamp[s_begin:s_end]
-        seq_y_mark = self.data_stamp[r_begin:r_end]
-
-        return seq_x, seq_y, seq_x_mark, seq_y_mark
+    def __getitem__(self, i):
+        return self.seq_x[i], self.resid[i], self.har[i], self.ytrue[i]
 
     def __len__(self):
-        return len(self.data_x) - self.seq_len - self.pred_len + 1
-
-    def inverse_transform(self, data):
-        return self.scaler.inverse_transform(data)
-
-
-class Dataset_M4(Dataset):
-    def __init__(self, args, root_path, flag='pred', size=None,
-                 features='S', data_path='ETTh1.csv',
-                 target='OT', scale=False, inverse=False, timeenc=0, freq='15min',
-                 seasonal_patterns='Yearly'):
-        # size [seq_len, label_len, pred_len]
-        # init
-        self.features = features
-        self.target = target
-        self.scale = scale
-        self.inverse = inverse
-        self.timeenc = timeenc
-        self.root_path = root_path
-
-        self.seq_len = size[0]
-        self.label_len = size[1]
-        self.pred_len = size[2]
-
-        self.seasonal_patterns = seasonal_patterns
-        self.history_size = M4Meta.history_size[seasonal_patterns]
-        self.window_sampling_limit = int(self.history_size * self.pred_len)
-        self.flag = flag
-
-        self.__read_data__()
-
-    def __read_data__(self):
-        # M4Dataset.initialize()
-        if self.flag == 'train':
-            dataset = M4Dataset.load(training=True, dataset_file=self.root_path)
-        else:
-            dataset = M4Dataset.load(training=False, dataset_file=self.root_path)
-        training_values = np.array(
-            [v[~np.isnan(v)] for v in
-             dataset.values[dataset.groups == self.seasonal_patterns]])  # split different frequencies
-        self.ids = np.array([i for i in dataset.ids[dataset.groups == self.seasonal_patterns]])
-        self.timeseries = [ts for ts in training_values]
-
-    def __getitem__(self, index):
-        insample = np.zeros((self.seq_len, 1))
-        insample_mask = np.zeros((self.seq_len, 1))
-        outsample = np.zeros((self.pred_len + self.label_len, 1))
-        outsample_mask = np.zeros((self.pred_len + self.label_len, 1))  # m4 dataset
-
-        sampled_timeseries = self.timeseries[index]
-        cut_point = np.random.randint(low=max(1, len(sampled_timeseries) - self.window_sampling_limit),
-                                      high=len(sampled_timeseries),
-                                      size=1)[0]
-
-        insample_window = sampled_timeseries[max(0, cut_point - self.seq_len):cut_point]
-        insample[-len(insample_window):, 0] = insample_window
-        insample_mask[-len(insample_window):, 0] = 1.0
-        outsample_window = sampled_timeseries[
-                           max(0, cut_point - self.label_len):min(len(sampled_timeseries), cut_point + self.pred_len)]
-        outsample[:len(outsample_window), 0] = outsample_window
-        outsample_mask[:len(outsample_window), 0] = 1.0
-        return insample, outsample, insample_mask, outsample_mask
-
-    def __len__(self):
-        return len(self.timeseries)
-
-    def inverse_transform(self, data):
-        return self.scaler.inverse_transform(data)
-
-    def last_insample_window(self):
-        """
-        The last window of insample size of all timeseries.
-        This function does not support batching and does not reshuffle timeseries.
-
-        :return: Last insample window of all timeseries. Shape "timeseries, insample size"
-        """
-        insample = np.zeros((len(self.timeseries), self.seq_len))
-        insample_mask = np.zeros((len(self.timeseries), self.seq_len))
-        for i, ts in enumerate(self.timeseries):
-            ts_last_window = ts[-self.seq_len:]
-            insample[i, -len(ts):] = ts_last_window
-            insample_mask[i, -len(ts):] = 1.0
-        return insample, insample_mask
-
-
-class PSMSegLoader(Dataset):
-    def __init__(self, args, root_path, win_size, step=1, flag="train"):
-        self.flag = flag
-        self.step = step
-        self.win_size = win_size
-        self.scaler = StandardScaler()
-        train_path = os.path.join(root_path, "train.csv")
-        test_path = os.path.join(root_path, "test.csv")
-        label_path = os.path.join(root_path, "test_label.csv")
-
-        if all(os.path.exists(p) for p in [train_path, test_path, label_path]):
-            train_df      = pd.read_csv(train_path)
-            test_df       = pd.read_csv(test_path)
-            test_label_df = pd.read_csv(label_path)
-        else:
-            ds_data  = load_dataset(HUGGINGFACE_REPO, name="PSM-data")
-            ds_label = load_dataset(HUGGINGFACE_REPO, name="PSM-label")
-            train_df      = ds_data["train"].to_pandas()
-            test_df       = ds_data["test"].to_pandas()
-            test_label_df = ds_label[next(iter(ds_label))].to_pandas()
-
-        data = train_df.values[:, 1:]
-        data = np.nan_to_num(data)
-        self.scaler.fit(data)
-        data = self.scaler.transform(data)
-        
-        test_data = test_df.values[:, 1:]
-        test_data = np.nan_to_num(test_data)
-        self.test = self.scaler.transform(test_data)
-        
-        self.train = data
-        data_len = len(self.train)
-        self.val = self.train[(int)(data_len * 0.8):]
-        self.test_labels = test_label_df.values[:, 1:]
-        print("test:", self.test.shape)
-        print("train:", self.train.shape)
-
-    def __len__(self):
-        if self.flag == "train":
-            return (self.train.shape[0] - self.win_size) // self.step + 1
-        elif (self.flag == 'val'):
-            return (self.val.shape[0] - self.win_size) // self.step + 1
-        elif (self.flag == 'test'):
-            return (self.test.shape[0] - self.win_size) // self.step + 1
-        else:
-            return (self.test.shape[0] - self.win_size) // self.win_size + 1
-
-    def __getitem__(self, index):
-        index = index * self.step
-        if self.flag == "train":
-            return np.float32(self.train[index:index + self.win_size]), np.float32(self.test_labels[0:self.win_size])
-        elif (self.flag == 'val'):
-            return np.float32(self.val[index:index + self.win_size]), np.float32(self.test_labels[0:self.win_size])
-        elif (self.flag == 'test'):
-            return np.float32(self.test[index:index + self.win_size]), np.float32(
-                self.test_labels[index:index + self.win_size])
-        else:
-            return np.float32(self.test[
-                              index // self.step * self.win_size:index // self.step * self.win_size + self.win_size]), np.float32(
-                self.test_labels[index // self.step * self.win_size:index // self.step * self.win_size + self.win_size])
-
-
-class MSLSegLoader(Dataset):
-    def __init__(self, args, root_path, win_size, step=1, flag="train"):
-        self.flag = flag
-        self.step = step
-        self.win_size = win_size
-        self.scaler = StandardScaler()
-        
-        train_path = os.path.join(root_path, "MSL_train.npy")
-        test_path  = os.path.join(root_path, "MSL_test.npy")
-        label_path = os.path.join(root_path, "MSL_test_label.npy")
-
-        if all(os.path.exists(p) for p in [train_path, test_path, label_path]):
-            train_data = np.load(train_path)
-            test_data  = np.load(test_path)
-            test_label = np.load(label_path)
-        else:
-            train_path = hf_hub_download(repo_id=HUGGINGFACE_REPO, filename="MSL/MSL_train.npy",repo_type="dataset")
-            test_path  = hf_hub_download(repo_id=HUGGINGFACE_REPO, filename="MSL/MSL_test.npy",repo_type="dataset")
-            label_path = hf_hub_download(repo_id=HUGGINGFACE_REPO, filename="MSL/MSL_test_label.npy",repo_type="dataset")
-
-            train_data  = np.load(train_path)
-            test_data   = np.load(test_path)
-            test_label  = np.load(label_path)
-
-        self.scaler.fit(train_data)
-        train_data = self.scaler.transform(train_data)
-        test_data  = self.scaler.transform(test_data)
-
-        self.train = train_data
-        self.test  = test_data
-        self.test_labels = test_label
-
-        data_len = len(self.train)
-        self.val = self.train[int(data_len * 0.8):]
-
-        print("test:", self.test.shape)
-        print("train:", self.train.shape)
-
-    def __len__(self):
-        if self.flag == "train":
-            return (self.train.shape[0] - self.win_size) // self.step + 1
-        elif (self.flag == 'val'):
-            return (self.val.shape[0] - self.win_size) // self.step + 1
-        elif (self.flag == 'test'):
-            return (self.test.shape[0] - self.win_size) // self.step + 1
-        else:
-            return (self.test.shape[0] - self.win_size) // self.win_size + 1
-
-    def __getitem__(self, index):
-        index = index * self.step
-        if self.flag == "train":
-            return np.float32(self.train[index:index + self.win_size]), np.float32(self.test_labels[0:self.win_size])
-        elif (self.flag == 'val'):
-            return np.float32(self.val[index:index + self.win_size]), np.float32(self.test_labels[0:self.win_size])
-        elif (self.flag == 'test'):
-            return np.float32(self.test[index:index + self.win_size]), np.float32(
-                self.test_labels[index:index + self.win_size])
-        else:
-            return np.float32(self.test[
-                              index // self.step * self.win_size:index // self.step * self.win_size + self.win_size]), np.float32(
-                self.test_labels[index // self.step * self.win_size:index // self.step * self.win_size + self.win_size])
-
-
-class SMAPSegLoader(Dataset):
-    def __init__(self, args, root_path, win_size, step=1, flag="train"):
-        self.flag = flag
-        self.step = step
-        self.win_size = win_size
-        self.scaler = StandardScaler()
-        
-        train_path = os.path.join(root_path, "SMAP_train.npy")
-        test_path  = os.path.join(root_path, "SMAP_test.npy")
-        label_path = os.path.join(root_path, "SMAP_test_label.npy")
-
-        if all(os.path.exists(p) for p in [train_path, test_path, label_path]):
-            train_data = np.load(train_path)
-            test_data  = np.load(test_path)
-            test_label = np.load(label_path)
-        else:
-            train_path = hf_hub_download(repo_id=HUGGINGFACE_REPO, filename="SMAP/SMAP_train.npy",repo_type="dataset")
-            test_path  = hf_hub_download(repo_id=HUGGINGFACE_REPO, filename="SMAP/SMAP_test.npy",repo_type="dataset")
-            label_path = hf_hub_download(repo_id=HUGGINGFACE_REPO, filename="SMAP/SMAP_test_label.npy",repo_type="dataset")
-
-            train_data  = np.load(train_path)
-            test_data   = np.load(test_path)
-            test_label = np.load(label_path)
-
-        # 标准化
-        self.scaler.fit(train_data)
-        train_data = self.scaler.transform(train_data)
-        test_data  = self.scaler.transform(test_data)
-
-        self.train = train_data
-        self.test  = test_data
-        self.test_labels = test_label
-
-        data_len = len(self.train)
-        self.val = self.train[int(data_len * 0.8):]
-
-        print("test:", self.test.shape)
-        print("train:", self.train.shape)
-
-    def __len__(self):
-
-        if self.flag == "train":
-            return (self.train.shape[0] - self.win_size) // self.step + 1
-        elif (self.flag == 'val'):
-            return (self.val.shape[0] - self.win_size) // self.step + 1
-        elif (self.flag == 'test'):
-            return (self.test.shape[0] - self.win_size) // self.step + 1
-        else:
-            return (self.test.shape[0] - self.win_size) // self.win_size + 1
-
-    def __getitem__(self, index):
-        index = index * self.step
-        if self.flag == "train":
-            return np.float32(self.train[index:index + self.win_size]), np.float32(self.test_labels[0:self.win_size])
-        elif (self.flag == 'val'):
-            return np.float32(self.val[index:index + self.win_size]), np.float32(self.test_labels[0:self.win_size])
-        elif (self.flag == 'test'):
-            return np.float32(self.test[index:index + self.win_size]), np.float32(
-                self.test_labels[index:index + self.win_size])
-        else:
-            return np.float32(self.test[
-                              index // self.step * self.win_size:index // self.step * self.win_size + self.win_size]), np.float32(
-                self.test_labels[index // self.step * self.win_size:index // self.step * self.win_size + self.win_size])
-
-
-class SMDSegLoader(Dataset):
-    def __init__(self, args, root_path, win_size, step=100, flag="train"):
-        self.flag = flag
-        self.step = step
-        self.win_size = win_size
-        self.scaler = StandardScaler()
-        
-        train_path = os.path.join(root_path, "SMD_train.npy")
-        test_path  = os.path.join(root_path, "SMD_test.npy")
-        label_path = os.path.join(root_path, "SMD_test_label.npy")
-
-        if all(os.path.exists(p) for p in [train_path, test_path, label_path]):
-            train_data = np.load(train_path)
-            test_data  = np.load(test_path)
-            test_label = np.load(label_path)
-        else:
-            train_path = hf_hub_download(repo_id=HUGGINGFACE_REPO, filename="SMD/SMD_train.npy",repo_type="dataset")
-            test_path  = hf_hub_download(repo_id=HUGGINGFACE_REPO, filename="SMD/SMD_test.npy",repo_type="dataset")
-            label_path = hf_hub_download(repo_id=HUGGINGFACE_REPO, filename="SMD/SMD_test_label.npy",repo_type="dataset")
-
-            train_data  = np.load(train_path)
-            test_data   = np.load(test_path)
-            test_label = np.load(label_path)
-            
-        self.scaler.fit(train_data)
-        train_data = self.scaler.transform(train_data)
-        test_data = self.scaler.transform(test_data)
-        self.train = train_data
-        self.test = test_data
-        data_len = len(self.train)
-        self.val = self.train[(int)(data_len * 0.8):]
-        self.test_labels = test_label
-        print("test:", self.test.shape)
-        print("train:", self.train.shape)
-
-    def __len__(self):
-        if self.flag == "train":
-            return (self.train.shape[0] - self.win_size) // self.step + 1
-        elif (self.flag == 'val'):
-            return (self.val.shape[0] - self.win_size) // self.step + 1
-        elif (self.flag == 'test'):
-            return (self.test.shape[0] - self.win_size) // self.step + 1
-        else:
-            return (self.test.shape[0] - self.win_size) // self.win_size + 1
-
-    def __getitem__(self, index):
-        index = index * self.step
-        if self.flag == "train":
-            return np.float32(self.train[index:index + self.win_size]), np.float32(self.test_labels[0:self.win_size])
-        elif (self.flag == 'val'):
-            return np.float32(self.val[index:index + self.win_size]), np.float32(self.test_labels[0:self.win_size])
-        elif (self.flag == 'test'):
-            return np.float32(self.test[index:index + self.win_size]), np.float32(
-                self.test_labels[index:index + self.win_size])
-        else:
-            return np.float32(self.test[
-                              index // self.step * self.win_size:index // self.step * self.win_size + self.win_size]), np.float32(
-                self.test_labels[index // self.step * self.win_size:index // self.step * self.win_size + self.win_size])
-
-
-class SWATSegLoader(Dataset):
-    def __init__(self, args, root_path, win_size, step=1, flag="train"):
-        self.flag = flag
-        self.step = step
-        self.win_size = win_size
-        self.scaler = StandardScaler()
-
-        train2_path = os.path.join(root_path, "swat_train2.csv")
-        test_path   = os.path.join(root_path, "swat2.csv")
-        if all(os.path.exists(p) for p in [train2_path, test_path]):
-            train_data = pd.read_csv(train2_path)
-            test_data   = pd.read_csv(test_path)
-        else:
-            ds = load_dataset(HUGGINGFACE_REPO, name="SWaT")
-            train_data = ds["train"].to_pandas()
-            test_data  = ds["test"].to_pandas()
-        labels = test_data.values[:, -1:]
-        train_data = train_data.values[:, :-1]
-        test_data = test_data.values[:, :-1]
-
-        self.scaler.fit(train_data)
-        train_data = self.scaler.transform(train_data)
-        test_data = self.scaler.transform(test_data)
-        self.train = train_data
-        self.test = test_data
-        data_len = len(self.train)
-        self.val = self.train[(int)(data_len * 0.8):]
-        self.test_labels = labels
-        print("test:", self.test.shape)
-        print("train:", self.train.shape)
-
-    def __len__(self):
-        """
-        Number of images in the object dataset.
-        """
-        if self.flag == "train":
-            return (self.train.shape[0] - self.win_size) // self.step + 1
-        elif (self.flag == 'val'):
-            return (self.val.shape[0] - self.win_size) // self.step + 1
-        elif (self.flag == 'test'):
-            return (self.test.shape[0] - self.win_size) // self.step + 1
-        else:
-            return (self.test.shape[0] - self.win_size) // self.win_size + 1
-
-    def __getitem__(self, index):
-        index = index * self.step
-        if self.flag == "train":
-            return np.float32(self.train[index:index + self.win_size]), np.float32(self.test_labels[0:self.win_size])
-        elif (self.flag == 'val'):
-            return np.float32(self.val[index:index + self.win_size]), np.float32(self.test_labels[0:self.win_size])
-        elif (self.flag == 'test'):
-            return np.float32(self.test[index:index + self.win_size]), np.float32(
-                self.test_labels[index:index + self.win_size])
-        else:
-            return np.float32(self.test[
-                              index // self.step * self.win_size:index // self.step * self.win_size + self.win_size]), np.float32(
-                self.test_labels[index // self.step * self.win_size:index // self.step * self.win_size + self.win_size])
-
-
-class UEAloader(Dataset):
-    """
-    Dataset class for datasets included in:
-        Time Series Classification Archive (www.timeseriesclassification.com)
-    Argument:
-        limit_size: float in (0, 1) for debug
-    Attributes:
-        all_df: (num_samples * seq_len, num_columns) dataframe indexed by integer indices, with multiple rows corresponding to the same index (sample).
-            Each row is a time step; Each column contains either metadata (e.g. timestamp) or a feature.
-        feature_df: (num_samples * seq_len, feat_dim) dataframe; contains the subset of columns of `all_df` which correspond to selected features
-        feature_names: names of columns contained in `feature_df` (same as feature_df.columns)
-        all_IDs: (num_samples,) series of IDs contained in `all_df`/`feature_df` (same as all_df.index.unique() )
-        labels_df: (num_samples, num_labels) pd.DataFrame of label(s) for each sample
-        max_seq_len: maximum sequence (time series) length. If None, script argument `max_seq_len` will be used.
-            (Moreover, script argument overrides this attribute)
-    """
-
-    def __init__(self, args, root_path, file_list=None, limit_size=None, flag=None):
-        self.args = args
-        self.root_path = root_path
-        self.flag = flag
-        self.all_df, self.labels_df = self.load_all(root_path, file_list=file_list, flag=flag)
-        self.all_IDs = self.all_df.index.unique()  # all sample IDs (integer indices 0 ... num_samples-1)
-
-        if limit_size is not None:
-            if limit_size > 1:
-                limit_size = int(limit_size)
-            else:  # interpret as proportion if in (0, 1]
-                limit_size = int(limit_size * len(self.all_IDs))
-            self.all_IDs = self.all_IDs[:limit_size]
-            self.all_df = self.all_df.loc[self.all_IDs]
-
-        # use all features
-        self.feature_names = self.all_df.columns
-        self.feature_df = self.all_df
-
-        # pre_process
-        normalizer = Normalizer()
-        self.feature_df = normalizer.normalize(self.feature_df)
-        print(len(self.all_IDs))
-
-    def _resolve_ts_path(self, root_path, dataset_name, flag):
-        split = "TRAIN" if "train" in str(flag).lower() else "TEST"
-        fname = f"{dataset_name}_{split}.ts"
-        local = os.path.join(root_path, fname)
-        if os.path.exists(local):
-            return local
-        return hf_hub_download(HUGGINGFACE_REPO, filename=f"{dataset_name}/{fname}", repo_type="dataset")
-
-    def load_all(self, root_path, file_list=None, flag=None):
-        """
-        Loads datasets from ts files contained in `root_path` into a dataframe, optionally choosing from `pattern`
-        Args:
-            root_path: directory containing all individual .ts files
-            file_list: optionally, provide a list of file paths within `root_path` to consider.
-                Otherwise, entire `root_path` contents will be used.
-        Returns:
-            all_df: a single (possibly concatenated) dataframe with all data corresponding to specified files
-            labels_df: dataframe containing label(s) for each sample
-        """
-        # Select paths for training and evaluation
-        dataset_name = self.args.model_id
-        ts_path = self._resolve_ts_path(root_path, dataset_name, flag or "train")
-
-        all_df, labels_df = self.load_single(ts_path)
-        return all_df, labels_df
-
-    def load_single(self, filepath):
-        df, labels = load_from_tsfile_to_dataframe(filepath, return_separate_X_and_y=True,
-                                                             replace_missing_vals_with='NaN')
-        labels = pd.Series(labels, dtype="category")
-        self.class_names = labels.cat.categories
-        labels_df = pd.DataFrame(labels.cat.codes,
-                                 dtype=np.int8)  # int8-32 gives an error when using nn.CrossEntropyLoss
-
-        lengths = df.applymap(
-            lambda x: len(x)).values  # (num_samples, num_dimensions) array containing the length of each series
-
-        horiz_diffs = np.abs(lengths - np.expand_dims(lengths[:, 0], -1))
-
-        if np.sum(horiz_diffs) > 0:  # if any row (sample) has varying length across dimensions
-            df = df.applymap(subsample)
-
-        lengths = df.applymap(lambda x: len(x)).values
-        vert_diffs = np.abs(lengths - np.expand_dims(lengths[0, :], 0))
-        if np.sum(vert_diffs) > 0:  # if any column (dimension) has varying length across samples
-            self.max_seq_len = int(np.max(lengths[:, 0]))
-        else:
-            self.max_seq_len = lengths[0, 0]
-
-        # First create a (seq_len, feat_dim) dataframe for each sample, indexed by a single integer ("ID" of the sample)
-        # Then concatenate into a (num_samples * seq_len, feat_dim) dataframe, with multiple rows corresponding to the
-        # sample index (i.e. the same scheme as all datasets in this project)
-
-        df = pd.concat((pd.DataFrame({col: df.loc[row, col] for col in df.columns}).reset_index(drop=True).set_index(
-            pd.Series(lengths[row, 0] * [row])) for row in range(df.shape[0])), axis=0)
-
-        # Replace NaN values
-        grp = df.groupby(by=df.index)
-        df = grp.transform(interpolate_missing)
-
-        return df, labels_df
-
-    def instance_norm(self, case):
-        if self.root_path.count('EthanolConcentration') > 0:  # special process for numerical stability
-            mean = case.mean(0, keepdim=True)
-            case = case - mean
-            stdev = torch.sqrt(torch.var(case, dim=1, keepdim=True, unbiased=False) + 1e-5)
-            case /= stdev
-            return case
-        else:
-            return case
-
-    def __getitem__(self, ind):
-        batch_x = self.feature_df.loc[self.all_IDs[ind]].values
-        labels = self.labels_df.loc[self.all_IDs[ind]].values
-        if self.flag == "TRAIN" and self.args.augmentation_ratio > 0:
-            num_samples = len(self.all_IDs)
-            num_columns = self.feature_df.shape[1]
-            seq_len = int(self.feature_df.shape[0] / num_samples)
-            batch_x = batch_x.reshape((1, seq_len, num_columns))
-            batch_x, labels, augmentation_tags = run_augmentation_single(batch_x, labels, self.args)
-
-            batch_x = batch_x.reshape((1 * seq_len, num_columns))
-
-        return self.instance_norm(torch.from_numpy(batch_x)), \
-               torch.from_numpy(labels)
-
-    def __len__(self):
-        return len(self.all_IDs)
+        return len(self.seq_x)
+
+    def inverse_resid(self, r_std_pred):
+        """De-standardise a residual prediction back to ln(RV) scale."""
+        return r_std_pred * self.r_std + self.r_mean
