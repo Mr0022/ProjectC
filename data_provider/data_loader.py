@@ -48,9 +48,30 @@ def year_split_borders(dates, seq_len, n_rows):
 
 
 class Dataset_Custom(Dataset):
+    """
+    Generic CSV dataset with a chronological year-based split.
+
+    Two options exist for realized-variance work, both off by default so that
+    every other dataset (ETT, Weather, Traffic, ...) is untouched:
+
+      log              -- replace the feature columns with their natural log,
+                          so the network is trained on ln(RV) instead of RV.
+                          Mirrors the --log switch of HAR-RV_RUN.PY.
+      drop_nonpositive -- drop rows whose target is <= 0. Implied by `log`,
+                          since ln is undefined there. On EUR/USD RV these are
+                          the two exchange holidays with no trading, which
+                          HAR-RV_RUN.PY also drops; dropping them here keeps
+                          the two models on exactly the same rows.
+
+    drop_nonpositive must stay opt-in: targets like ETT oil temperature are
+    legitimately negative, and dropping those rows would silently destroy the
+    series.
+    """
+
     def __init__(self, root_path, flag='train', size=None,
                  features='S', data_path='ETTh1.csv',
-                 target='OT', scale=False, timeenc=0, freq='h'):
+                 target='OT', scale=False, timeenc=0, freq='h',
+                 log=False, drop_nonpositive=False):
         # size [seq_len, label_len, pred_len]
         # info
         if size == None:
@@ -65,12 +86,16 @@ class Dataset_Custom(Dataset):
         assert flag in ['train', 'test', 'val']
         type_map = {'train': 0, 'val': 1, 'test': 2}
         self.set_type = type_map[flag]
+        self.flag = flag
 
         self.features = features
         self.target = target
         self.scale = scale
         self.timeenc = timeenc
         self.freq = freq
+        self.log = log
+        # ln(x) needs x > 0, so --log always drops non-positive targets.
+        self.drop_nonpositive = drop_nonpositive or log
 
         self.root_path = root_path
         self.data_path = data_path
@@ -83,6 +108,17 @@ class Dataset_Custom(Dataset):
         # guard against blank/incomplete trailing rows (e.g. Excel exports):
         # NaN targets would silently poison windows and test metrics
         df_raw = df_raw.dropna(subset=['date', self.target]).reset_index(drop=True)
+
+        # Drop non-positive targets BEFORE the borders are computed, so the
+        # split still counts real rows. Same rule as HAR-RV_RUN.PY.
+        if self.drop_nonpositive:
+            bad = df_raw[self.target] <= 0
+            if bad.any():
+                if self.flag == 'train':
+                    print(f"  Dropped {int(bad.sum())} non-positive '"
+                          f"{self.target}' row(s) (non-trading days): "
+                          f"{list(df_raw.loc[bad, 'date'].astype(str))}")
+                df_raw = df_raw[~bad].reset_index(drop=True)
 
         '''
         df_raw.columns: ['date', ...(other features), target feature]
@@ -105,6 +141,20 @@ class Dataset_Custom(Dataset):
         elif self.features == 'S':
             df_data = df_raw[[self.target]]
 
+        # THE TRANSFORM. Applied to the feature columns themselves, so every
+        # window the model ever sees -- input, label and target -- is ln(RV).
+        # The horizon aggregation in Exp_Long_Term_Forecast._get_target then
+        # runs on this scale.
+        if self.log:
+            nonpos = (df_data <= 0).any()
+            if bool(nonpos.any()):
+                raise ValueError(
+                    f"--log needs strictly positive features, but column(s) "
+                    f"{list(df_data.columns[nonpos])} contain values <= 0. "
+                    f"Only the target column is filtered automatically; drop "
+                    f"or fix the other columns, or run without --log.")
+            df_data = np.log(df_data)
+
         if self.scale:
             train_data = df_data[border1s[0]:border2s[0]]
             self.scaler.fit(train_data.values)
@@ -114,11 +164,11 @@ class Dataset_Custom(Dataset):
 
         df_stamp = df_raw[['date']][border1:border2].copy()
         if self.timeenc == 0:
-            df_stamp['month'] = df_stamp.date.apply(lambda row: row.month, 1)
-            df_stamp['day'] = df_stamp.date.apply(lambda row: row.day, 1)
-            df_stamp['weekday'] = df_stamp.date.apply(lambda row: row.weekday(), 1)
-            df_stamp['hour'] = df_stamp.date.apply(lambda row: row.hour, 1)
-            data_stamp = df_stamp.drop(['date'], 1).values
+            df_stamp['month'] = df_stamp.date.apply(lambda row: row.month)
+            df_stamp['day'] = df_stamp.date.apply(lambda row: row.day)
+            df_stamp['weekday'] = df_stamp.date.apply(lambda row: row.weekday())
+            df_stamp['hour'] = df_stamp.date.apply(lambda row: row.hour)
+            data_stamp = df_stamp.drop(columns=['date']).values
         elif self.timeenc == 1:
             data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=self.freq)
             data_stamp = data_stamp.transpose(1, 0)
@@ -212,13 +262,13 @@ class Dataset_Pred(Dataset):
         df_stamp = pd.DataFrame(columns=['date'])
         df_stamp.date = list(tmp_stamp.date.values) + list(pred_dates[1:])
         if self.timeenc == 0:
-            df_stamp['month'] = df_stamp.date.apply(lambda row: row.month, 1)
-            df_stamp['day'] = df_stamp.date.apply(lambda row: row.day, 1)
-            df_stamp['weekday'] = df_stamp.date.apply(lambda row: row.weekday(), 1)
-            df_stamp['hour'] = df_stamp.date.apply(lambda row: row.hour, 1)
-            df_stamp['minute'] = df_stamp.date.apply(lambda row: row.minute, 1)
+            df_stamp['month'] = df_stamp.date.apply(lambda row: row.month)
+            df_stamp['day'] = df_stamp.date.apply(lambda row: row.day)
+            df_stamp['weekday'] = df_stamp.date.apply(lambda row: row.weekday())
+            df_stamp['hour'] = df_stamp.date.apply(lambda row: row.hour)
+            df_stamp['minute'] = df_stamp.date.apply(lambda row: row.minute)
             df_stamp['minute'] = df_stamp.minute.map(lambda x: x // 15)
-            data_stamp = df_stamp.drop(['date'], 1).values
+            data_stamp = df_stamp.drop(columns=['date']).values
         elif self.timeenc == 1:
             data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=self.freq)
             data_stamp = data_stamp.transpose(1, 0)

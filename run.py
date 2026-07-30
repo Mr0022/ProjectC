@@ -23,13 +23,16 @@ if __name__ == '__main__':
                         help='model name, options: [Autoformer, Transformer, TimesNet]')
 
     # data loader
-    parser.add_argument('--data', type=str, required=True, default='ETTh1', help='dataset type')
-    parser.add_argument('--root_path', type=str, default='./data/ETT/', help='root path of the data file')
-    parser.add_argument('--data_path', type=str, default='ETTh1.csv', help='data file')
-    parser.add_argument('--features', type=str, default='M',
+    # Defaults describe the shipped EUR/USD realized-variance dataset, so a bare
+    # `python run.py --task_name long_term_forecast --is_training 1
+    #  --model_id x --model DLinear` trains on data/EURUSD-RV.csv.
+    parser.add_argument('--data', type=str, default='custom', help='dataset type')
+    parser.add_argument('--root_path', type=str, default='./data/', help='root path of the data file')
+    parser.add_argument('--data_path', type=str, default='EURUSD-RV.csv', help='data file')
+    parser.add_argument('--features', type=str, default='S',
                         help='forecasting task, options:[M, S, MS]; M:multivariate predict multivariate, S:univariate predict univariate, MS:multivariate predict univariate')
-    parser.add_argument('--target', type=str, default='OT', help='target feature in S or MS task')
-    parser.add_argument('--freq', type=str, default='h',
+    parser.add_argument('--target', type=str, default='RV', help='target feature in S or MS task')
+    parser.add_argument('--freq', type=str, default='d',
                         help='freq for time features encoding, options:[s:secondly, t:minutely, h:hourly, d:daily, b:business days, w:weekly, m:monthly], you can also use more detailed freq like 15min or 3h')
     parser.add_argument('--checkpoints', type=str, default='./checkpoints/', help='location of model checkpoints')
 
@@ -40,8 +43,19 @@ if __name__ == '__main__':
     parser.add_argument('--seasonal_patterns', type=str, default='Monthly', help='subset for M4')
     parser.add_argument('--inverse', action='store_true', help='inverse output data', default=False)
     parser.add_argument('--aggregate_mean', action='store_true', default=False,
-                        help='multi-horizon mean aggregation (Option 1): model forecasts a single '
-                             'value = log(mean(RV)) over the pred_len horizon (RV=exp(ln_RV))')
+                        help='multi-horizon mean aggregation: the model forecasts a SINGLE value, '
+                             'the pred_len-day forward average of RV -- mean(RV) in raw mode and '
+                             'ln(mean(RV)) under --log. This is exactly the HAR-RV_RUN.PY target '
+                             'Y^(h), so set it (with pred_len = h) to compare against HAR-RV.')
+    parser.add_argument('--log', action='store_true', default=False,
+                        help='train and evaluate on ln(RV) instead of raw RV. The series is logged '
+                             'at load time and the horizon target becomes ln(mean(RV)) -- the log '
+                             'sits OUTSIDE the mean, matching HAR-RV_RUN.PY --log. Implies '
+                             '--drop_nonpositive, since ln needs strictly positive values.')
+    parser.add_argument('--drop_nonpositive', action='store_true', default=False,
+                        help='drop rows whose target is <= 0 (non-trading days in RV data). Implied '
+                             'by --log. Keep it off for datasets where negative targets are '
+                             'meaningful, e.g. ETT oil temperature.')
 
     # inputation task
     parser.add_argument('--mask_rate', type=float, default=0.25, help='mask ratio')
@@ -183,6 +197,18 @@ if __name__ == '__main__':
     parser.add_argument('--pos', type=int, choices=[0, 1], default=1, help='Positional Embedding. Set pos to 0 or 1')
 
     args = parser.parse_args()
+
+    # --aggregate_mean means "the target is an average of variances", which only
+    # makes sense for a strictly positive series, and --log needs positivity for
+    # ln. Either one therefore implies dropping non-positive rows -- the same
+    # rule HAR-RV_RUN.PY applies unconditionally. Without this the raw-scale run
+    # would train on the zero-RV non-trading days that HAR drops, and the two
+    # models would no longer be fitted on the same rows.
+    if (args.aggregate_mean or args.log) and not args.drop_nonpositive:
+        args.drop_nonpositive = True
+        print('Non-positive targets will be dropped (implied by '
+              '--aggregate_mean/--log; keeps the sample identical to HAR-RV).')
+
     if torch.cuda.is_available() and args.use_gpu:
         args.device = torch.device('cuda:{}'.format(args.gpu))
         print('Using GPU')

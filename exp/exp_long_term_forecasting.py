@@ -1,7 +1,7 @@
 from data_provider.data_factory import data_provider
 from exp.exp_basic import Exp_Basic
 from utils.tools import EarlyStopping, adjust_learning_rate, visual
-from utils.metrics import metric
+from utils.metrics import metric, QLIKE, lognormal_back_transform
 import torch
 import torch.nn as nn
 from torch import optim
@@ -21,11 +21,11 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         super(Exp_Long_Term_Forecast, self).__init__(args)
 
     def _build_model(self):
-        # Mean-aggregation (Option 1): the model forecasts a SINGLE value -- the
-        # log of the horizon-average variance, log(mean(RV)). Build the head with
-        # target_window=1 by temporarily setting pred_len=1, then restore the
-        # original pred_len so the data loader still returns the full future
-        # window (needed to build the ground-truth mean in _get_target).
+        # Mean-aggregation: the model forecasts a SINGLE value -- the horizon
+        # average of RV (or its log). Build the head with target_window=1 by
+        # temporarily setting pred_len=1, then restore the original pred_len so
+        # the data loader still returns the full future window (needed to build
+        # the ground-truth mean in _get_target).
         if getattr(self.args, 'aggregate_mean', False):
             orig_pred_len = self.args.pred_len
             self.args.pred_len = 1
@@ -39,25 +39,145 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         return model
 
     def _get_target(self, batch_y, f_dim):
-        """Slice the future window and, if aggregating, reduce it to the Option-1
-        target log(mean(RV)) over the horizon.
+        """Slice the future window and, when aggregating, reduce it to the
+        HAR-RV target Y^(h) over the pred_len horizon.
 
-        The input/target series is ln_RV, so RV = exp(ln_RV) and
-            log(mean(RV)) = logsumexp(ln_RV) - log(h)
-        which aggregates in variance space (the additive, economically correct
-        space) while staying numerically stable. If the dataset also exposes a
-        raw ``RV`` future window (data has a separate RV column), that is used
-        directly instead of exp(ln_RV)."""
+        The aggregation ALWAYS happens in variance space -- the additive space,
+        where averaging variances is the meaningful operation -- and the log,
+        when there is one, is applied to the aggregate:
+
+            raw mode :  Y^(h) =     (1/h) * Sum_k RV_(t+k)
+            --log    :  Y^(h) = ln( (1/h) * Sum_k RV_(t+k) )
+
+        These are exactly the two targets HAR-RV_RUN.PY builds, so a run with
+        --aggregate_mean and pred_len = h is directly comparable to HAR-RV at
+        horizon h on the matching scale.
+
+        Under --log the series already holds ln(RV), so the log-of-mean is
+        computed as
+            ln(mean(exp(ln_RV))) == logsumexp(ln_RV) - ln(h)
+        which is algebraically identical but avoids exponentiating a possibly
+        large magnitude before summing. Note this is log-of-mean, NOT
+        mean-of-logs: averaging the logs would target a geometric forward mean,
+        a smaller and much smoother quantity that would not line up with the
+        raw-mode target or with HAR-RV.
+        """
         y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
         if getattr(self.args, 'aggregate_mean', False):
             h = y.shape[1]
-            # log(mean(exp(ln_RV))) == logsumexp(ln_RV) - log(h)
-            y = torch.logsumexp(y, dim=1, keepdim=True) - math.log(h)
+            if getattr(self.args, 'log', False):
+                # series is ln(RV): ln(mean(RV)) = logsumexp(ln_RV) - ln(h)
+                y = torch.logsumexp(y, dim=1, keepdim=True) - math.log(h)
+            else:
+                # series is raw RV: plain arithmetic mean over the horizon
+                y = y.mean(dim=1, keepdim=True)
         return y
 
     def _get_data(self, flag):
         data_set, data_loader = data_provider(self.args, flag)
         return data_set, data_loader
+
+    def _forward_collect(self, loader):
+        """Run the model over `loader` and return (preds, trues) as flat arrays
+        on the modelling scale. Used to measure the TRAINING residual variance
+        that the --log Jensen correction needs."""
+        preds, trues = [], []
+        self.model.eval()
+        with torch.no_grad():
+            for batch_x, batch_y, batch_x_mark, batch_y_mark in loader:
+                batch_x = batch_x.float().to(self.device)
+                batch_y = batch_y.float()
+                batch_x_mark = batch_x_mark.float().to(self.device)
+                batch_y_mark = batch_y_mark.float().to(self.device)
+
+                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
+                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp],
+                                    dim=1).float().to(self.device)
+                if self.args.use_amp:
+                    with torch.cuda.amp.autocast():
+                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                else:
+                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+
+                f_dim = -1 if self.args.features == 'MS' else 0
+                outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                target = self._get_target(batch_y, f_dim)
+                preds.append(outputs.detach().cpu().numpy().reshape(-1))
+                trues.append(target.detach().cpu().numpy().reshape(-1))
+        self.model.train()
+        return np.concatenate(preds), np.concatenate(trues)
+
+    def _report_rv_metrics(self, preds, trues, setting):
+        """
+        Report the test losses on the same footing as HAR-RV_RUN.PY, so this
+        model and the HAR-RV baseline can be read side by side.
+
+        raw mode -- preds/trues are already the h-day forward mean of RV, so
+        MSE/MAE/QLIKE are raw-variance losses and line up with HAR-RV's
+        raw-scale table directly.
+
+        --log -- preds/trues are ln(h-day forward mean of RV):
+          * MSE/MAE are reported in ln(RV) units, the scale the network is
+            trained on, and are NOT comparable to raw-scale losses.
+          * QLIKE needs variances, so both sides are exponentiated first, the
+            forecast with the lognormal Jensen correction exp(sigma^2/2) where
+            sigma^2 is the TRAINING residual variance -- the same estimator
+            HAR-RV_RUN.PY uses. QLIKE_naive omits the correction so its size
+            stays visible.
+          * MSE_RV/MAE_RV repeat the errors on that back-transformed variance
+            scale. Because the target is ln(arithmetic forward mean), exp()
+            recovers precisely the raw-mode target, so these ARE comparable to
+            a raw run and to HAR-RV at every horizon.
+        """
+        log_mode = getattr(self.args, 'log', False)
+        preds = np.asarray(preds, dtype=float).reshape(-1)
+        trues = np.asarray(trues, dtype=float).reshape(-1)
+
+        # QLIKE floor: same rule as HAR-RV_RUN.PY, 1e-4 * mean training RV.
+        train_data, train_loader = self._get_data(flag='train')
+        train_series = np.asarray(train_data.data_x, dtype=float)
+        mean_train_rv = float(np.mean(np.exp(train_series) if log_mode
+                                      else train_series))
+        floor = 1e-4 * mean_train_rv
+
+        lines = []
+        if not log_mode:
+            q, n_bad = QLIKE(preds, trues, floor)
+            lines += [f"  MSE        : {np.mean((trues - preds) ** 2):.6f}",
+                      f"  MAE        : {np.mean(np.abs(trues - preds)):.6f}",
+                      f"  QLIKE      : {q:.6f}",
+                      f"  neg pred   : {n_bad} ({100.0 * n_bad / len(preds):.1f}%)"]
+        else:
+            # Correction terms from TRAINING residuals only -- using test
+            # residuals would leak the out-of-sample outcome into the forecast.
+            tr_p, tr_t = self._forward_collect(train_loader)
+            resid = tr_t - tr_p
+            bias = float(resid.mean())
+            resid_var = float(resid.var(ddof=1))
+
+            actual_rv = np.exp(trues)
+            pred_rv = lognormal_back_transform(preds, resid_var, bias)
+            pred_naive = lognormal_back_transform(preds)
+            q, n_bad = QLIKE(actual_rv, pred_rv, floor)
+            q_naive, _ = QLIKE(actual_rv, pred_naive, floor)
+            shift = np.exp(bias + resid_var / 2.0)
+            lines += [
+                f"  MSE  [ln]  : {np.mean((trues - preds) ** 2):.6f}",
+                f"  MAE  [ln]  : {np.mean(np.abs(trues - preds)):.6f}",
+                f"  QLIKE [RV] : {q:.6f}   (naive exp: {q_naive:.6f})",
+                f"  MSE_RV     : {np.mean((actual_rv - pred_rv) ** 2):.6f}",
+                f"  MAE_RV     : {np.mean(np.abs(actual_rv - pred_rv)):.6f}",
+                f"  back-trans : bias={bias:+.6f}  sigma^2={resid_var:.6f}  -> "
+                f"x{shift:.4f}",
+                f"  neg pred   : {n_bad} (0 by construction under --log)"]
+
+        scale = 'ln_RV' if log_mode else 'raw_RV'
+        header = (f"  HAR-COMPARABLE TEST METRICS  [{scale}]  "
+                  f"h = {self.args.pred_len}   n = {len(preds)}")
+        block = "\n".join([header] + lines)
+        print("\n" + "=" * 72 + "\n" + block + "\n" + "=" * 72)
+        with open("result_long_term_forecast.txt", 'a') as f:
+            f.write(block + "\n\n")
 
     def _select_optimizer(self):
         model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
@@ -297,6 +417,13 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         f.write('\n')
         f.write('\n')
         f.close()
+
+        # With --aggregate_mean the target is the HAR-RV target Y^(h), so also
+        # report the losses the way HAR-RV_RUN.PY does (QLIKE, and the
+        # back-transformed variance scale under --log) to make the two
+        # directly comparable.
+        if getattr(self.args, 'aggregate_mean', False):
+            self._report_rv_metrics(preds, trues, setting)
 
         np.save(folder_path + 'metrics.npy', np.array([mae, mse, rmse, mape, mspe]))
         np.save(folder_path + 'pred.npy', preds)
