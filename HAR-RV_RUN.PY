@@ -6,10 +6,17 @@ Based on: Corsi, F. (2009). A simple approximate long-memory model of
 
 Horizons : h = 1  (daily),  h = 5  (weekly),  h = 22  (monthly)
 
-Split logic mirrors Dataset_Custom (data_loader.py):
-    Train : start of sample - end of 2023  (year <= 2023)
-    Test  : 2024 onwards                   (year >= 2024)
-    No validation split -- HAR-RV is OLS, no hyperparameters to tune.
+Split logic follows Dataset_Custom (data_loader.py), which splits
+    train 2012-2022  |  val 2023-2024  |  test 2025-end
+
+HAR-RV is OLS: there are no hyperparameters to tune, so a held-out validation
+set would serve no purpose. The validation years are therefore folded back
+into the estimation sample:
+    Train : start of sample - end of 2024  (year <= 2024)  [= DL train + val]
+    Test  : 2025 onwards                   (year >= 2025)  [= DL test]
+The TEST window is identical to the deep models', so out-of-sample losses
+remain directly comparable. Note the deep models never fit on 2023-2024;
+they only use it for early stopping / model selection.
 
 ------------------------------------------------------------------------------
 USAGE (command line / notebook)
@@ -115,8 +122,11 @@ from   scipy                               import stats
 DATA_FILE = "data/EURUSD-RV.csv"   # default data set (override with --data)
 OUT_DIR   = "."                    # where figures / CSVs are written (--outdir)
 
-TRAIN_END_YEAR  = 2023
-TEST_START_YEAR = 2024
+# Mirrors data_provider/data_loader.py: VAL_END_YEAR = 2024, so the deep
+# models' train (<=2022) and val (2023-2024) years both become HAR training
+# data, and the test window (2025-end) is shared.
+TRAIN_END_YEAR  = 2024
+TEST_START_YEAR = 2025
 
 # Forecast horizons and their Newey-West bandwidths: L = 2*(h-1)
 HORIZONS = {
@@ -469,7 +479,7 @@ def print_section(title: str):
     print(f"\n{SEP}\n  {title}\n{SEP}")
 
 def print_split_info(train: pd.DataFrame, test: pd.DataFrame, h: int):
-    print(f"\n  -- Split (mirrors Dataset_Custom) --------------------------")
+    print(f"\n  -- Split (follows Dataset_Custom) --------------------------")
     print(f"  {'Set':<8} {'Rows':>6}  {'Start':>12}  {'End':>12}  {'Years'}")
     print(f"  {THIN[:60]}")
     print(f"  {'Train':<8} {len(train):>6}  "
@@ -479,8 +489,9 @@ def print_split_info(train: pd.DataFrame, test: pd.DataFrame, h: int):
           f"{str(test.index[0].date()):>12}  {str(test.index[-1].date()):>12}  "
           f"{TEST_START_YEAR} - {SAMPLE_END_YEAR}")
     print(f"  {THIN[:60]}")
-    print(f"  Note: No validation split -- OLS has no hyperparameters.")
-    print(f"        Test window matches DL model for fair comparison.\n")
+    print(f"  Note: OLS has no hyperparameters, so the deep models' validation")
+    print(f"        years are folded into training. Test window is identical")
+    print(f"        to the DL models' for a like-for-like comparison.\n")
 
 def print_estimation_table(result, h: int):
     nw_lag   = HORIZONS[h]["nw_lag"]
@@ -913,7 +924,9 @@ def main(argv=None):
   Split:
     Train  {SAMPLE_START_YEAR} - {TRAIN_END_YEAR}  (year <= {TRAIN_END_YEAR})
     Test   {TEST_START_YEAR} - {SAMPLE_END_YEAR}   (year >= {TEST_START_YEAR})
-    Logic mirrors Dataset_Custom in data_loader.py.
+    Dataset_Custom (data_loader.py) splits train / val / test at the same
+    year boundaries; HAR-RV has no hyperparameters, so its validation years
+    are folded into the estimation sample. The test window is shared.
 
   References:
     Corsi, F. (2009). A simple approximate long-memory model of realized

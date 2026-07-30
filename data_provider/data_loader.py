@@ -11,6 +11,39 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
+# ==============================================================================
+# Chronological train / val / test split -- single source of truth.
+# Every dataset class in this file derives its borders from here, so changing
+# the years below propagates to every model.
+#
+#     train : start of sample      ..  end of TRAIN_END_YEAR   (2012 - 2022)
+#     val   : TRAIN_END_YEAR + 1   ..  end of VAL_END_YEAR     (2023 - 2024)
+#     test  : VAL_END_YEAR + 1     ..  end of sample           (2025 - end)
+# ==============================================================================
+TRAIN_END_YEAR = 2022
+VAL_END_YEAR = 2024
+
+
+def year_split_borders(dates, seq_len, n_rows):
+    """
+    Row borders for the chronological split, indexed by set_type
+    (0 = train, 1 = val, 2 = test).
+
+    `dates` must be datetime-like and aligned 1:1 with the data rows.
+
+    The val and test windows start seq_len rows early so the first forecast
+    origin in each split has a complete look-back window. Those extra rows are
+    context only -- they are never used as targets, so no target from an
+    earlier split is scored twice.
+
+    Returns (border1s, border2s); border2s[0] is also the train row count.
+    """
+    years = pd.Series(pd.to_datetime(pd.Series(dates).values)).dt.year
+    train_end = int((years <= TRAIN_END_YEAR).sum())
+    val_end = int((years <= VAL_END_YEAR).sum())
+    border1s = [0, train_end - seq_len, val_end - seq_len]
+    border2s = [train_end, val_end, n_rows]
+    return border1s, border2s
 
 
 
@@ -60,11 +93,9 @@ class Dataset_Custom(Dataset):
         df_raw = df_raw[['date'] + cols + [self.target]]
 
         df_raw['date'] = pd.to_datetime(df_raw['date'])
-        # train: 2010-2021, val: 2022-2023, test: 2024-2025
-        train_end = int((df_raw['date'].dt.year <= 2021).sum())
-        val_end = int((df_raw['date'].dt.year <= 2023).sum())
-        border1s = [0, train_end - self.seq_len, val_end - self.seq_len]
-        border2s = [train_end, val_end, len(df_raw)]
+        # train: 2012-2022, val: 2023-2024, test: 2025-end  (see year_split_borders)
+        border1s, border2s = year_split_borders(
+            df_raw['date'], self.seq_len, len(df_raw))
         border1 = border1s[self.set_type]
         border2 = border2s[self.set_type]
 
@@ -163,8 +194,12 @@ class Dataset_Custom_Events(Dataset_Custom):
         df_ev = df_ev.drop_duplicates(subset='date').set_index('date')
         events = df_ev.reindex(df_raw['date']).fillna(0.0)[ev_cols].values.astype(np.float32)
 
+        # same borders as data_x/data_y so row indices line up
+        border1s, border2s = year_split_borders(
+            df_raw['date'], self.seq_len, len(df_raw))
+        train_end = border2s[0]
+
         # standardise count columns on the TRAIN years only; keep evt_* binary
-        train_end = int((df_raw['date'].dt.year <= 2021).sum())
         count_idx = [i for i, c in enumerate(ev_cols) if not c.startswith('evt_')]
         if count_idx:
             tr = events[:train_end, count_idx]
@@ -173,10 +208,6 @@ class Dataset_Custom_Events(Dataset_Custom):
 
         self.event_cols = ev_cols
         self.n_event_features = events.shape[1]
-        # slice with the same borders as data_x/data_y so indices line up
-        val_end = int((df_raw['date'].dt.year <= 2023).sum())
-        border1s = [0, train_end - self.seq_len, val_end - self.seq_len]
-        border2s = [train_end, val_end, len(df_raw)]
         border1 = border1s[self.set_type]
         border2 = border2s[self.set_type]
         self.data_events = events[border1:border2]
@@ -303,7 +334,7 @@ class Dataset_HAR_Residual(Dataset):
     HAR-LSTM residual dataset (Corsi 2009 + LSTM correction).
 
     The HAR-RV linear model is fit by OLS on the TRAINING window only
-    (2010-2021, mirroring Dataset_Custom). Its prediction of the h-day
+    (2012-2022, mirroring Dataset_Custom). Its prediction of the h-day
     forward average log-RV is removed, and the LSTM is trained to forecast
     the HAR *residual* from a look-back window of observed ln(RV). The final
     hybrid forecast, reconstructed at test time, is:
@@ -386,15 +417,12 @@ class Dataset_HAR_Residual(Dataset):
         Yh = s.rolling(h).mean().shift(-h).values
 
         # ── Split borders (mirror Dataset_Custom; val kept separate) ─────────
-        years = df_raw[date_col].dt.year.values
-        train_end = int((years <= 2021).sum())
-        val_end = int((years <= 2023).sum())
-        border1s = [0, train_end - self.seq_len, val_end - self.seq_len]
-        border2s = [train_end, val_end, N]
+        border1s, border2s = year_split_borders(df_raw[date_col], self.seq_len, N)
+        train_end = border2s[0]
 
         feat_valid = (~np.isnan(RV_d)) & (~np.isnan(RV_w)) & (~np.isnan(RV_m))
 
-        # ── Fit HAR-RV by OLS on the TRAIN window only (2010-2021) ───────────
+        # ── Fit HAR-RV by OLS on the TRAIN window only (2012-2022) ───────────
         train_mask = np.zeros(N, dtype=bool)
         train_mask[:train_end] = True
         fit_mask = train_mask & feat_valid & (~np.isnan(Yh))
