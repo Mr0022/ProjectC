@@ -55,39 +55,44 @@ LEVELS regression:
 No logs are taken anywhere in this mode, so there is no Jensen gap to worry
 about -- there is no non-linear transform.
 
---log -- ln(RV). The log is applied to the SERIES FIRST, at load time, and the
-identical windows are then applied to the transformed series, so every HAR
-component is a MEAN OF LOGS:
+--log -- ln(RV), on the LOG OF MEAN convention. Each window is averaged on the
+raw variance scale and the log is taken of that average, i.e. the log sits
+OUTSIDE every sum:
 
-    x_t = ln(RV_t)
-
-    Target      Y_t^(h) = (1/h) * Sum_{k=1}^{h}  x_{t+k}
-    Regressors  x_d     =            x_{t-1}
-                x_w     = (1/5)  * Sum_{k=1}^{5}  x_{t-k}
-                x_m     = (1/22) * Sum_{k=1}^{22} x_{t-k}
+    Target      Y_t^(h) = ln(     (1/h) * Sum_{k=1}^{h}  RV_{t+k} )
+    Regressors  x_d     = ln(              RV_{t-1}              )
+                x_w     = ln(     (1/5)  * Sum_{k=1}^{5}  RV_{t-k} )
+                x_m     = ln(     (1/22) * Sum_{k=1}^{22} RV_{t-k} )
 
 This is the log-HAR of Corsi (2009) sec. 3.2 and Andersen, Bollerslev &
 Diebold (2007). Everything downstream -- OLS, HAC covariance, diagnostics,
-figures, exports -- runs on x without further special-casing, because the
-loader hands the same four column names to the same code in both modes.
+figures, exports -- runs on these columns without further special-casing,
+because the loader hands the same four column names to the same code in both
+modes.
 
-MEAN OF LOGS vs LOG OF MEAN. These are different regressors and --log takes
-the first: (1/5)*Sum ln RV = ln(geometric mean), whereas ln((1/5)*Sum RV) =
-ln(arithmetic mean), and geometric <= arithmetic always. Log-first is the
-usual log-HAR convention and is the literal reading of "log the data, then
-compute". Two consequences worth knowing before reading the output:
-  * The h-day target under --log is the log of a GEOMETRIC forward mean. At
-    h=1 it coincides with the raw-mode target, RV_{t+1}; at h>1 it does not,
-    so back-transformed losses are exactly comparable across modes only at
-    h=1. At h>1 part of any gap is Jensen, not forecasting skill.
-  * SUM vs MEAN becomes cosmetic again on this scale: sums shift Y and the
-    regressors by the constant ln(window), which the intercept absorbs.
+LOG OF MEAN vs MEAN OF LOGS -- why the placement of the log matters. The two
+are different regressors: ln((1/5)*Sum RV) = ln(arithmetic mean), whereas
+(1/5)*Sum ln RV = ln(geometric mean), and geometric <= arithmetic always.
+This script uses LOG OF MEAN throughout, which buys one important property:
+
+    exp( Y_t^(h) )  ==  the raw-mode target, exactly, at EVERY horizon.
+
+So a back-transformed --log forecast predicts the very same quantity the
+levels regression predicts, and the two modes can be ranked against each
+other directly at h=1, 5 and 22 alike. Under mean-of-logs the target would be
+a GEOMETRIC forward mean -- systematically smaller, and much smoother, since
+a lone spike moves a geometric mean only through an h-th root. Cross-mode
+losses would then favour the log fit for arithmetic rather than forecasting
+reasons, and would be honest only at h=1, where the two means coincide.
+
+The daily component is identical under both conventions: a one-day window has
+nothing to aggregate, so it is ln(RV_{t-1}) either way.
 
 WHAT --log CHANGES IN THE OUTPUT
   1. MSE and MAE are reported in ln(RV) units -- the scale the model is
      actually fitted on. They are NOT comparable to raw-scale losses. MSE_RV
-     and MAE_RV are also reported for cross-mode ranking (subject to the h>1
-     caveat above).
+     and MAE_RV are also reported, on the back-transformed variance scale,
+     and those ARE comparable to a raw-scale run at every horizon.
   2. QLIKE is only defined for variances, so it is evaluated after mapping
      the forecast back with the lognormal (Jensen) correction
          E[RV | F] = exp( E[ln RV | F] + sigma^2 / 2 )
@@ -138,9 +143,9 @@ output. Each of these is what --log exists to address:
      numbers produced by --log. Any deep-learning baseline must be evaluated
      on whichever scale is being reported.
 
-INPUT: the loader accepts either a raw 'RV' column or an 'ln_RV' column, and
-converts once, in whichever direction the chosen mode needs -- so neither mode
-ever round-trips a value through exp() and log() unnecessarily.
+INPUT: the loader accepts either a raw 'RV' column or an 'ln_RV' column and
+converts once as needed. Note that --log needs raw variances regardless, since
+its windows are averaged before the log is applied.
 Non-positive RV rows -- exchange holidays with no trading -- are dropped. That
 drop is also what keeps --log defined at all, since ln(0) is not.
 
@@ -330,19 +335,29 @@ def out_prefix() -> str:
     return "har_rv_log" if LOG_MODE else "har_rv"
 
 def var_labels() -> dict:
-    """Coefficient row labels for the estimation table."""
-    unit = "ln RV" if LOG_MODE else "RV"
-    return {"const": "Intercept (b0)",
-            "RV_d" : f"Daily {unit}".ljust(10) + " (b_d)",
-            "RV_w" : f"Weekly {unit}".ljust(10) + " (b_w)",
-            "RV_m" : f"Monthly {unit}".ljust(10) + " (b_m)"}
+    """
+    Coefficient row labels for the estimation table.
+
+    Under --log the regressor is ln(mean RV over the window), so the label
+    wraps the window in ln(.). Writing it the other way round ("Weekly ln RV")
+    would read as a weekly mean OF logs -- the convention this script
+    deliberately does not use.
+    """
+    names = ({"RV_d": "ln(Daily RV)", "RV_w": "ln(Weekly RV)",
+              "RV_m": "ln(Monthly RV)"} if LOG_MODE else
+             {"RV_d": "Daily RV", "RV_w": "Weekly RV", "RV_m": "Monthly RV"})
+    out = {"const": "Intercept (b0)"}
+    for key, short in (("RV_d", "b_d"), ("RV_w", "b_w"), ("RV_m", "b_m")):
+        out[key] = names[key].ljust(10) + f" ({short})"
+    return out
 
 def coef_panel_labels() -> dict:
     """Coefficient panel titles for the coefficient-path figure."""
-    unit = "ln RV" if LOG_MODE else ""
-    suff = f" {unit}".rstrip()
-    return {"const": "b0  (Intercept)",     "RV_d": f"b_d (Daily{suff})",
-            "RV_w" : f"b_w (Weekly{suff})", "RV_m": f"b_m (Monthly{suff})"}
+    if LOG_MODE:
+        return {"const": "b0  (Intercept)",    "RV_d": "b_d (ln Daily RV)",
+                "RV_w": "b_w (ln Weekly RV)", "RV_m": "b_m (ln Monthly RV)"}
+    return {"const": "b0  (Intercept)", "RV_d": "b_d (Daily)",
+            "RV_w": "b_w (Weekly)",    "RV_m": "b_m (Monthly)"}
 
 
 # ==============================================================================
@@ -372,14 +387,17 @@ def parse_args(argv=None):
         help="Directory for output figures and CSVs (created if missing).")
     p.add_argument(
         "--log", action="store_true", default=LOG_MODE,
-        help="Take logs FIRST, then do every computation on the log scale: the "
-             "RV series becomes ln(RV) at load time, so the HAR components and "
-             "the h-day target are all averages OF LOGS, the OLS fit is the "
-             "log-HAR of Corsi (2009) sec. 3.2 / Andersen et al. (2007), and "
-             "MSE/MAE are reported in ln(RV) units. QLIKE needs variances, so "
-             "it is evaluated after exp(), with the lognormal Jensen "
-             "correction. Outputs are written as har_rv_log_* so they do not "
-             "overwrite a raw-scale run.")
+        help="Run the whole pipeline on the ln(RV) scale, using the LOG OF MEAN "
+             "convention: each window (and the h-day target) is averaged on the "
+             "raw variance scale and the log is taken of that average, so the "
+             "log sits outside every sum. The OLS fit is then the log-HAR of "
+             "Corsi (2009) sec. 3.2 / Andersen et al. (2007) and MSE/MAE are "
+             "reported in ln(RV) units. QLIKE needs variances, so it is "
+             "evaluated after exp() with the lognormal Jensen correction; "
+             "because exp() of this target recovers the raw-mode target "
+             "exactly, the back-transformed losses are comparable to a "
+             "raw-scale run at every horizon. Outputs are written as "
+             "har_rv_log_* so they do not overwrite a raw-scale run.")
     p.add_argument(
         "--train-end-year", type=int, default=TRAIN_END_YEAR, metavar="YEAR",
         help="Last calendar year (inclusive) of the training sample.")
@@ -453,31 +471,43 @@ def load_base_features(filepath: str) -> pd.DataFrame:
         RV_w = (1/5)  * Sum_{k=1}^{5}  RV_{t-k}
         RV_m = (1/22) * Sum_{k=1}^{22} RV_{t-k}
 
-    LOG mode (--log) -- the log-HAR. The TRANSFORM COMES FIRST: the series
-    becomes x_t = ln(RV_t) at load time and the same three windows are then
-    applied to x, so every component is a MEAN OF LOGS:
+    LOG mode (--log) -- the log-HAR, LOG OF MEAN. Each window is averaged on
+    the RAW variance scale first and the log is taken of that average:
 
-        x_d  = x_{t-1}                        = ln RV_{t-1}
-        x_w  = (1/5)  * Sum_{k=1}^{5}  x_{t-k}
-        x_m  = (1/22) * Sum_{k=1}^{22} x_{t-k}
+        x_d  = ln(        RV_{t-1}                 )
+        x_w  = ln( (1/5)  * Sum_{k=1}^{5}  RV_{t-k} )
+        x_m  = ln( (1/22) * Sum_{k=1}^{22} RV_{t-k} )
 
-    Mean-of-logs vs log-of-mean. Both appear in the literature and they are
-    NOT the same regressor: (1/5)*Sum ln RV = ln( geometric mean ) whereas
-    ln( (1/5)*Sum RV ) = ln( arithmetic mean ), and by Jensen the former is
-    always the smaller of the two. This function implements mean-of-logs,
-    i.e. log first then aggregate, which is the usual log-HAR convention
-    (Andersen, Bollerslev, Diebold & Labys, 2003; Andersen, Bollerslev &
-    Diebold, 2007) and is exactly what --log asks for. Note that the earlier
-    "ln(sum) = ln(mean) + ln(window), absorbed by the intercept" remark in
-    the header applies to the log-of-aggregate family, not to this one -- for
-    mean-of-logs the window divisor really is just a constant, so sums and
-    means differ by ln(window) and the intercept absorbs it.
+    Log-of-mean vs mean-of-logs. Both appear in the literature and they are
+    NOT the same regressor: ln( (1/5)*Sum RV ) = ln( arithmetic mean ) while
+    (1/5)*Sum ln RV = ln( geometric mean ), and by Jensen the latter is always
+    the smaller. This function implements LOG OF MEAN, so every component is
+    the log of an arithmetic average of variances -- the aggregation happens
+    on the scale where averaging variances is meaningful, and only then is the
+    log applied.
+
+    The daily component is unaffected by the choice: a window of one has
+    nothing to aggregate, so log-of-mean and mean-of-logs both reduce to
+    ln(RV_{t-1}) exactly.
+
+    Why this convention matters downstream: because the target (see
+    build_horizon_target) is likewise ln( arithmetic forward mean ),
+    exponentiating a --log forecast recovers the SAME quantity raw mode
+    predicts, at every horizon. Under mean-of-logs it would recover a
+    geometric mean instead, which is a different -- and systematically
+    smaller, smoother -- object, and cross-mode losses would only be
+    comparable at h=1.
+
+    Sums vs means remain cosmetic on this scale: ln(sum) = ln(mean) +
+    ln(window), and the intercept absorbs the constant.
 
     Column handling
     ---------------
     'RV'    -> raw variance; logged here iff --log.
-    'ln_RV' -> already logged; used as-is under --log, exponentiated once for
-               raw mode (no needless exp/log round trip in either direction).
+    'ln_RV' -> already logged; exponentiated once to raw RV, which --log needs
+               anyway in order to average the windows on the variance scale.
+               The one-day component still reads the input column directly, so
+               it never round-trips through exp() and log().
     Otherwise the first numeric column is taken and ASSUMED to be raw RV;
     a warning is printed, because silently transforming the wrong column
     is exactly the bug this loader is written to avoid.
@@ -487,10 +517,11 @@ def load_base_features(filepath: str) -> pd.DataFrame:
     undefined, and ln(RV) undefined as well -- so the drop is what keeps --log
     well defined at all.
 
-    Both scales are returned. 'RV' carries the MODELLING series (ln(RV) under
-    --log, raw RV otherwise) and is what the regressors and target are built
-    from; 'RV_raw' always carries raw RV, and is used for the descriptive
-    summary and the QLIKE floor.
+    Both scales are returned. 'RV' carries the one-day modelling series
+    (ln(RV) under --log, raw RV otherwise); 'RV_raw' always carries raw RV,
+    and under --log it is the series the multi-day windows are averaged over
+    before the log is applied. 'RV_raw' also feeds the descriptive summary and
+    the QLIKE floor.
 
     All windows use shift(1), so the information set ends strictly at t-1 --
     no look-ahead. Regressors are IDENTICAL across horizons; only the target
@@ -527,13 +558,10 @@ def load_base_features(filepath: str) -> pd.DataFrame:
         if ln_in is not None:
             ln_in = ln_in.reindex(s_raw.index)
 
-    # THE TRANSFORM. Everything downstream -- windows, target, OLS, losses --
-    # operates on `s`, so taking the log here is what puts the whole pipeline
-    # on the log scale.
     if LOG_MODE:
         s = ln_in if ln_in is not None else np.log(s_raw)
-        print("  --log: series transformed to ln(RV) BEFORE any aggregation, so")
-        print("         RV_d/RV_w/RV_m and Y_h below are all MEANS OF LOGS.")
+        print("  --log: HAR components are LOGS OF MEANS -- each window is")
+        print("         averaged on the raw variance scale, then logged.")
     else:
         s = s_raw
         if ln_in is not None:
@@ -543,9 +571,18 @@ def load_base_features(filepath: str) -> pd.DataFrame:
     SAMPLE_END_YEAR   = int(s.index[-1].year)
 
     df = pd.DataFrame({"RV": s, "RV_raw": s_raw})
-    df["RV_d"] = s.shift(1)
-    df["RV_w"] = s.shift(1).rolling(LAG_W).mean()
-    df["RV_m"] = s.shift(1).rolling(LAG_M).mean()
+    if LOG_MODE:
+        # ln( arithmetic mean of RV over the window ). Averaging happens on
+        # RV_raw -- the scale on which averaging variances means something --
+        # and the log is applied to the aggregate, never term by term.
+        prev = s_raw.shift(1)
+        df["RV_d"] = s.shift(1)                              # window 1: ln RV_{t-1}
+        df["RV_w"] = np.log(prev.rolling(LAG_W).mean())
+        df["RV_m"] = np.log(prev.rolling(LAG_M).mean())
+    else:
+        df["RV_d"] = s.shift(1)
+        df["RV_w"] = s.shift(1).rolling(LAG_W).mean()
+        df["RV_m"] = s.shift(1).rolling(LAG_M).mean()
     return df   # NaN rows dropped per-horizon after target is attached
 
 
@@ -555,20 +592,27 @@ def load_base_features(filepath: str) -> pd.DataFrame:
 
 def build_horizon_target(df_base: pd.DataFrame, h: int) -> pd.DataFrame:
     """
-    Construct the h-day forward AVERAGE of the modelling series as the
-    dependent variable -- Corsi (2009) eq. 3:
+    Construct the h-day forward target -- Corsi (2009) eq. 3:
 
-        raw  :  Y_t^(h) = (1/h) * Sum_{k=1}^{h} RV_{t+k}
-        --log:  Y_t^(h) = (1/h) * Sum_{k=1}^{h} ln RV_{t+k}
+        raw  :  Y_t^(h) =     (1/h) * Sum_{k=1}^{h} RV_{t+k}
+        --log:  Y_t^(h) = ln( (1/h) * Sum_{k=1}^{h} RV_{t+k} )
 
     For h = 1 both collapse to the one-day value, RV_t or ln RV_t.
 
-    The code is scale-agnostic: it averages df_base['RV'], which the loader
-    has already put on the requested scale. Under --log the average of logs
-    is the log of the GEOMETRIC mean of forward RV, not of the arithmetic
-    mean -- the two differ by Jensen's inequality and only coincide at h=1.
-    This matters when reading back-transformed losses, so it is flagged again
-    in compute_metrics() and in the metrics table.
+    Note where the log sits: OUTSIDE the sum. The forward window is averaged
+    on the raw variance scale and the log is taken of that average, matching
+    the log-of-mean convention used for the regressors. So the --log target is
+    the log of the ARITHMETIC forward mean, and
+
+        exp( Y_t^(h) ) == the raw-mode target, exactly, at every horizon.
+
+    That identity is what makes the two modes comparable. Had the log been
+    taken inside the sum -- (1/h) * Sum ln RV_{t+k} -- the target would be the
+    log of a GEOMETRIC forward mean: a smaller and much smoother object, since
+    a single spike lifts a geometric mean by only h-th roots. Back-transformed
+    losses would then flatter the log model for reasons that are arithmetic
+    rather than forecasting skill, and would be honestly comparable only at
+    h=1 where the two means coincide.
 
     Window convention: rolling(h).mean().shift(-(h-1)) spans t ... t+h-1.
     Every regressor is shifted by one day, so the information set ends at
@@ -583,9 +627,12 @@ def build_horizon_target(df_base: pd.DataFrame, h: int) -> pd.DataFrame:
     """
     df = df_base.copy()
     if h == 1:
+        # Window of one: nothing to aggregate, so the modelling series already
+        # is the target on whichever scale is in force.
         df["Y_h"] = df["RV"]
     else:
-        df["Y_h"] = df["RV"].rolling(h).mean().shift(-(h - 1))
+        fwd = df["RV_raw"].rolling(h).mean().shift(-(h - 1))
+        df["Y_h"] = np.log(fwd) if LOG_MODE else fwd
     return df.dropna(subset=["Y_h", "RV_d", "RV_w", "RV_m"])
 
 
@@ -653,7 +700,8 @@ def fit_har_rv(train: pd.DataFrame, h: int):
 
         raw  :  Y_t^(h) = b0 + b_d*RV_d   + b_w*RV_w   + b_m*RV_m   + e_t
         --log:  Y_t^(h) = b0 + b_d*x_d    + b_w*x_w    + b_m*x_m    + e_t
-                where x = ln(RV) and Y^(h) is the forward mean of logs.
+                where each x is ln(mean RV over its window) and Y^(h) is
+                ln(mean RV over the h-day forward window) -- log outside.
 
     Standard errors are Newey-West (1987) HAC with the bandwidth from
     nw_bandwidth(). The HAC estimator is doing more work in levels than under
@@ -730,6 +778,13 @@ def back_transform(pred_log: np.ndarray, resid_var: float) -> np.ndarray:
     when the log residuals are Gaussian and a good approximation otherwise
     (Andersen, Bollerslev, Diebold & Labys, 2003).
 
+    With the log-of-mean target this lands on exactly the right object: the
+    regressand is ln(arithmetic forward mean), so the corrected forecast
+    estimates E[(1/h) * Sum RV_{t+k} | F] -- the same conditional mean the raw
+    levels regression estimates directly. The correction fixes median -> mean;
+    it does NOT convert one kind of average into another, which is why the
+    aggregation convention has to be right in the first place.
+
     The result is strictly positive, which is why --log cannot produce the
     non-positive variance forecasts the levels regression does.
     """
@@ -749,13 +804,15 @@ def compute_metrics(actual, predicted, floor: float,
         criterion and is not spike-dominated the way levels MSE is.
       * QLIKE is undefined on logs (it needs a variance ratio), so both sides
         are exponentiated first: actual exp(Y_h), forecast back_transform(.).
-        Both sides are the same object, so the comparison is internally
-        consistent -- at h=1 the pair is literally (RV, RV_hat).
+        Because the target is ln(arithmetic forward mean), exp(Y_h) is the
+        raw-mode target exactly -- at h=1 the pair is literally (RV, RV_hat).
       * MSE_RV / MAE_RV repeat the errors on the back-transformed variance
-        scale, so a --log run can be ranked against a raw run. At h=1 that
-        comparison is exact. At h>1 the log target is a geometric mean while
-        the raw target is an arithmetic mean, so the two runs are forecasting
-        slightly different objects and the gap is a Jensen gap, not skill.
+        scale, so a --log run can be ranked against a raw run. With the
+        log-of-mean convention this holds at EVERY horizon: both modes are
+        predicting the same arithmetic forward mean and are scored against
+        identical actuals, so the numbers sit side by side with no Jensen
+        caveat. (Under mean-of-logs they would not; see
+        build_horizon_target.)
       * QLIKE_naive is QLIKE without the Jensen correction, reported so the
         size of the correction is visible rather than taken on trust.
     """
@@ -915,11 +972,13 @@ def print_metrics_by_horizon(all_metrics: dict):
         print("        it is far less spike-dominated than levels MSE.")
         print("        QLIKE needs variances, so it is evaluated after exp() with")
         print("        the Jensen correction; MSE_RV/MAE_RV are the same forecasts")
-        print("        on that back-transformed variance scale, for ranking against")
-        print("        a raw-scale run. That ranking is exact at h=1 only: at h>1")
-        print("        the log target is a GEOMETRIC forward mean and the raw one")
-        print("        an ARITHMETIC forward mean, so the two are forecasting")
-        print("        different objects and geometric <= arithmetic always.")
+        print("        on that back-transformed variance scale.")
+        print("        MSE_RV/MAE_RV/QLIKE ARE directly comparable to a raw-scale")
+        print("        run at EVERY horizon: the target is ln(arithmetic forward")
+        print("        mean), so exp() recovers precisely the quantity raw mode")
+        print("        predicts, and both modes are scored against identical")
+        print("        actuals. (A mean-of-logs target would instead give a")
+        print("        geometric forward mean and break that at h>1.)")
         print("        'neg pred' is 0 by construction here -- exp() cannot return")
         print("        a non-positive variance. That is the main practical gain")
         print("        over the levels fit.")
@@ -965,9 +1024,11 @@ def print_diagnostics(diag: dict, h: int):
 # ==============================================================================
 
 def _ylab(h):
+    # Under --log the log is OUTSIDE the bar: ln of the mean, not the mean of
+    # logs. \overline{\ln RV} would state the wrong specification.
     if LOG_MODE:
         return (r"$\ln RV_t$" if h == 1
-                else rf"$\overline{{\ln RV}}_{{t,t+{h}}}$")
+                else rf"$\ln \overline{{RV}}_{{t,t+{h}}}$")
     return (r"$RV_t$" if h == 1
             else rf"$\overline{{RV}}_{{t,t+{h}}}$")
 
@@ -1260,8 +1321,8 @@ def main(argv=None):
     print(f"  HAR-RV MULTI-HORIZON MODEL  --  Corsi (2009)  --  {scale_banner()}")
     print("  EUR/USD Realized Variance  |  Horizons: h = 1, 5, 22")
     if LOG_MODE:
-        print("  --log: RV -> ln(RV) first, then arithmetic averages of LOGS on")
-        print("         BOTH sides. MSE/MAE in ln(RV) units; QLIKE after exp().")
+        print("  --log: ln( arithmetic mean of RV ) on BOTH sides -- log outside")
+        print("         the sums. MSE/MAE in ln(RV) units; QLIKE after exp().")
     else:
         print("  Aggregation: arithmetic averages of RV on BOTH sides -- no logs")
         print("  (pass --log to run the same pipeline on the ln(RV) scale)")
@@ -1380,8 +1441,8 @@ def main(argv=None):
               f"{m['n_neg_pred']:>10}")
     print(THIN)
     if LOG_MODE:
-        print(f"  Back-transformed to the variance scale (for comparison with a")
-        print(f"  raw-scale run -- exact at h=1, geometric-vs-arithmetic at h>1):")
+        print(f"  Back-transformed to the variance scale -- directly comparable to")
+        print(f"  a raw-scale run at every horizon (same target, same actuals):")
         print(f"  {'Horizon':<14} {'':>8} {'MSE_RV':>12} {'MAE_RV':>12}")
         for h in HORIZONS:
             m = all_metrics[h]["test"]
@@ -1390,11 +1451,11 @@ def main(argv=None):
         print(THIN)
     if LOG_MODE:
         print(f"""
-  Aggregation (--log: logs taken FIRST, then averaged -- means of logs):
-    Target     Y^(h) = (1/h) * Sum_k ln RV_(t+k)  over the h-day forward window
-    Regressors RV_d  = ln RV_(t-1)
-               RV_w  = mean of ln RV over the previous 5 days
-               RV_m  = mean of ln RV over the previous 22 days
+  Aggregation (--log: average on the RAW scale, then take the log):
+    Target     Y^(h) = ln( (1/h) * Sum_k RV_(t+k) )  over the forward window
+    Regressors RV_d  = ln( RV_(t-1) )
+               RV_w  = ln( mean RV over the previous 5 days )
+               RV_m  = ln( mean RV over the previous 22 days )
 
   Reading the output:
     * MSE/MAE are in ln(RV) units and are NOT comparable to raw-scale losses.
@@ -1409,10 +1470,11 @@ def main(argv=None):
     * Breusch-Pagan should be far smaller than in the levels fit -- that is
       the transform working. HAC is still used for the serial correlation,
       which logging does not remove.
-    * At h=1 the log and raw targets are the same object, so back-transformed
-      losses are directly comparable to a raw run. At h>1 they are not: the
-      log target is a geometric forward mean, the raw target an arithmetic
-      one, and geometric <= arithmetic by Jensen.
+    * The log sits OUTSIDE the sum on both sides, so exp(Y^(h)) is exactly
+      the raw-mode target and MSE_RV/MAE_RV/QLIKE can be set beside a raw
+      run at every horizon, not just h=1. Averaging logs instead would make
+      the target a geometric forward mean -- smaller and smoother -- and
+      would flatter this mode at h>1 for purely arithmetic reasons.
 
   Split:""")
     else:
