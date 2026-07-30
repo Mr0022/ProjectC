@@ -21,6 +21,13 @@
 
 model_name=${MODEL:-DLinear}
 
+# TimeMixer mixes across scales, so it needs at least two of them. Upstream
+# always passes these three flags; without them run.py stops with an error.
+extra=""
+if [ "$model_name" = "TimeMixer" ]; then
+  extra="--down_sampling_layers 3 --down_sampling_window 2 --down_sampling_method avg"
+fi
+
 for pred_len in 1 5 22; do
   for mode in raw log; do
 
@@ -50,7 +57,8 @@ for pred_len in 1 5 22; do
       --dec_in 1 \
       --c_out 1 \
       --des "RV_${mode}_h${pred_len}" \
-      --itr 1
+      --itr 1 \
+      $extra
 
   done
 done

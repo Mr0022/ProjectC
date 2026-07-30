@@ -96,7 +96,13 @@ if __name__ == '__main__':
     parser.add_argument('--use_norm', type=int, default=1, help='whether to use normalize; True 1 False 0')
     parser.add_argument('--down_sampling_layers', type=int, default=0, help='num of down sampling layers')
     parser.add_argument('--down_sampling_window', type=int, default=1, help='down sampling window size')
-    parser.add_argument('--down_sampling_method', type=str, default=None,
+    # Must default to 'avg', as upstream TimeMixer does. TimeMixer is the only
+    # model that reads this. With any other value its __multi_scale_process_inputs
+    # returns x_enc unchanged -- a [B, T, N] tensor instead of the list of scales
+    # forecast() expects -- so zip() then iterates the tensor and yields 2-D
+    # slices, and `B, T, N = x.size()` dies with "expected 3, got 2". A default of
+    # None made TimeMixer impossible to run without knowing to pass this flag.
+    parser.add_argument('--down_sampling_method', type=str, default='avg',
                         help='down sampling method, only support avg, max, conv')
     parser.add_argument('--seg_len', type=int, default=96,
                         help='the length of segmen-wise iteration of SegRNN')
@@ -208,6 +214,17 @@ if __name__ == '__main__':
         args.drop_nonpositive = True
         print('Non-positive targets will be dropped (implied by '
               '--aggregate_mean/--log; keeps the sample identical to HAR-RV).')
+
+    # TimeMixer mixes ACROSS scales, so it needs at least two of them: with
+    # down_sampling_layers = 0 the scale list holds a single entry and the model
+    # dies on `season_list[1]` with a bare IndexError from inside its mixing
+    # block. Upstream leaves the default at 0 and relies on every script passing
+    # the flag; fail loudly here instead so the cause is obvious.
+    if args.model == 'TimeMixer' and args.down_sampling_layers < 1:
+        parser.error(
+            "TimeMixer is a multi-scale model and needs --down_sampling_layers "
+            ">= 1 (upstream uses 3). Re-run with e.g. --down_sampling_layers 3 "
+            "--down_sampling_window 2 --down_sampling_method avg.")
 
     if torch.cuda.is_available() and args.use_gpu:
         args.device = torch.device('cuda:{}'.format(args.gpu))
