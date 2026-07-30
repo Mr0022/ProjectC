@@ -83,11 +83,49 @@ INPUT: the loader accepts either a raw 'RV' column (used as-is) or an
 'ln_RV' column (exponentiated back to raw RV once, at load time).
 Non-positive RV rows -- exchange holidays with no trading -- are dropped.
 
-HAC bandwidth (Patton & Sheppard, 2009; Bollerslev et al., 2016):
-    L = 2*(h-1), applied via Newey-West (1987) Bartlett kernel.
-    h=1  -> L=0  (standard OLS SEs; no overlap)
-    h=5  -> L=8
-    h=22 -> L=42
+HAC bandwidth -- Newey-West (1987) Bartlett kernel, L chosen as
+
+    L = max( 2*(h-1),  floor(4*(T/100)^(2/9)) )
+
+  * 2*(h-1) is the overlap term (Patton & Sheppard, 2009; Bollerslev et al.,
+    2016). Averaging RV over h forward days induces an MA(h-1) structure in
+    the residuals of the h-step regression, and the bandwidth must at least
+    cover it. It is a FLOOR, not the whole answer.
+  * floor(4*(T/100)^(2/9)) is the Newey & West (1994) plug-in rule, which
+    handles serial correlation that is in the data rather than induced by
+    the overlap. With T ~ 3.3k this evaluates to 8.
+
+    h=1  -> L=8   (overlap floor 0, so the data-driven rule binds)
+    h=5  -> L=8   (overlap floor 8)
+    h=22 -> L=42  (overlap floor 42)
+
+Why h=1 is NOT L=0. There is no overlap at h=1, so 2*(h-1) = 0 -- but that
+does not mean the residuals are serially uncorrelated, and here they are
+not: Ljung-Box(20) on the h=1 training residuals rejects at p ~ 0.002.
+Setting L=0 would assume away autocorrelation the data plainly shows.
+
+Two distinct problems existed at h=1, and only one of them was cosmetic.
+
+  (a) Wrong description. HAC with maxlags=0 does NOT give classical OLS
+      standard errors -- the Bartlett kernel keeps only the j=0 term, so it
+      reduces exactly to White/HC1. The old comment named the wrong object.
+  (b) Wrong inference. HC1 is robust to heteroskedasticity but NOT to
+      autocorrelation, and the h=1 residuals are autocorrelated. So the
+      reported h=1 standard errors were genuinely understated for the
+      persistent regressors -- a substantive error, not a labelling one:
+
+          b_d :  SE 0.049 -> 0.030   (t  3.02 -> 5.04)
+          b_w :  SE 0.080 -> 0.099   (t  4.78 -> 3.88)
+          b_m :  SE 0.060 -> 0.087   (t  5.11 -> 3.50)
+
+      (classical OLS understates further still: SE(b_d) = 0.020.)
+
+All three coefficients stay significant at 1%, so no conclusion in this
+sample flips -- but the old t-statistics on the weekly and monthly
+components were inflated by 23% and 46% respectively.
+
+Pass --nw-lag-rule overlap to fall back to the pure L=2*(h-1) convention as
+a robustness check.
 
 Metrics   : MSE, MAE, QLIKE (Patton, 2011) -- computed on the RAW RV scale
 ==============================================================================
@@ -128,12 +166,18 @@ OUT_DIR   = "."                    # where figures / CSVs are written (--outdir)
 TRAIN_END_YEAR  = 2024
 TEST_START_YEAR = 2025
 
-# Forecast horizons and their Newey-West bandwidths: L = 2*(h-1)
+# Forecast horizons. 'overlap_lag' = 2*(h-1) is the MA(h-1) floor induced by
+# the overlapping h-day target; 'nw_lag' is the bandwidth actually used and is
+# filled in at fit time by nw_bandwidth(), which can raise it above the floor.
 HORIZONS = {
-    1  : {"label": "Daily   (h=1)",  "nw_lag":  0},
-    5  : {"label": "Weekly  (h=5)",  "nw_lag":  8},
-    22 : {"label": "Monthly (h=22)", "nw_lag": 42},
+    1  : {"label": "Daily   (h=1)",  "overlap_lag":  0, "nw_lag":  0},
+    5  : {"label": "Weekly  (h=5)",  "overlap_lag":  8, "nw_lag":  8},
+    22 : {"label": "Monthly (h=22)", "overlap_lag": 42, "nw_lag": 42},
 }
+
+# Bandwidth rule: 'auto' = max(overlap floor, Newey-West 1994 plug-in),
+# 'overlap' = the pure 2*(h-1) convention (robustness check).
+NW_LAG_RULE = "auto"
 
 LAG_W    = 5    # weekly component window
 LAG_M    = 22   # monthly component window
@@ -215,6 +259,12 @@ def parse_args(argv=None):
         "--qlike-floor-frac", type=float, default=QLIKE_FLOOR_FRAC, metavar="FRAC",
         help="Non-positive forecasts are floored at FRAC * mean(training RV) "
              "before QLIKE is evaluated.")
+    p.add_argument(
+        "--nw-lag-rule", choices=["auto", "overlap"], default=NW_LAG_RULE,
+        help="Newey-West bandwidth. 'auto' = max(2*(h-1), Newey-West 1994 "
+             "plug-in), which keeps h=1 from collapsing to L=0 despite the "
+             "residual autocorrelation Ljung-Box detects. 'overlap' = the "
+             "pure 2*(h-1) convention, for robustness checks.")
     return p.parse_args(argv)
 
 
@@ -378,18 +428,60 @@ def split_by_year(df: pd.DataFrame,
 # 4.  HAR-RV OLS ESTIMATION  (per horizon)
 # ==============================================================================
 
+def newey_west_1994_lag(nobs: int) -> int:
+    """
+    Newey & West (1994) automatic bandwidth: L = floor(4 * (T/100)^(2/9)).
+
+    This is the data-driven part of the rule -- it targets serial correlation
+    that is present in the series itself, independently of any overlap in the
+    dependent variable. For T ~ 3.3k it returns 8.
+    """
+    return int(np.floor(4.0 * (nobs / 100.0) ** (2.0 / 9.0)))
+
+
+def nw_bandwidth(h: int, nobs: int, rule: str = "auto") -> int:
+    """
+    Newey-West bandwidth for horizon h on a training sample of `nobs` rows.
+
+    'auto'    : max(2*(h-1), newey_west_1994_lag(nobs)).
+                2*(h-1) covers the MA(h-1) autocorrelation MECHANICALLY
+                induced by the overlapping h-day target (Patton & Sheppard,
+                2009). It is a floor: at h=1 it is 0, which would imply the
+                residuals are serially uncorrelated. They are not -- Ljung-Box
+                rejects on this sample -- so the plug-in rule takes over and
+                the h=1 regression gets a genuine HAC covariance instead of a
+                merely heteroskedasticity-robust one. For h=5 and h=22 the
+                overlap floor (8 and 42) dominates, so those horizons keep the
+                conventional bandwidth exactly.
+    'overlap' : the pure 2*(h-1) convention, for robustness checks.
+    """
+    overlap = HORIZONS[h]["overlap_lag"]
+    if rule == "overlap":
+        return overlap
+    return max(overlap, newey_west_1994_lag(nobs))
+
+
 def fit_har_rv(train: pd.DataFrame, h: int):
     """
     Estimate HAR-RV by OLS in LEVELS for forecast horizon h.
 
         Y_t^(h) = b0 + b_d*RV_d + b_w*RV_w + b_m*RV_m + e_t
 
-    HAC bandwidth L = 2*(h-1), Newey-West (1987) Bartlett kernel. The HAC
-    estimator is doing more work here than in the log version: raw-RV
-    residuals are strongly heteroskedastic, and Newey-West corrects for
-    that as well as for the overlap-induced autocorrelation.
+    Standard errors are Newey-West (1987) HAC with the bandwidth from
+    nw_bandwidth(). The HAC estimator is doing more work here than in the log
+    version: raw-RV residuals are strongly heteroskedastic, and Newey-West
+    corrects for that as well as for the autocorrelation.
+
+    Caution when reading the code: statsmodels' cov_type="HAC" with maxlags=0
+    is NOT classical OLS -- the Bartlett kernel retains only the j=0 term, so
+    it reduces exactly to White/HC1. That is robust, but it is not a HAC
+    correction, which is why h=1 no longer runs with L=0.
+
+    The bandwidth actually used is written back into HORIZONS[h]["nw_lag"] so
+    the tables and figures report what was estimated rather than a constant.
     """
-    nw_lag = HORIZONS[h]["nw_lag"]
+    nw_lag = nw_bandwidth(h, len(train), NW_LAG_RULE)
+    HORIZONS[h]["nw_lag"] = nw_lag
     Y = train["Y_h"]
     X = sm.add_constant(train[["RV_d", "RV_w", "RV_m"]])
     return OLS(Y, X).fit(
@@ -504,7 +596,9 @@ def print_estimation_table(result, h: int):
                 "RV_w" : "Weekly RV  (b_w)",
                 "RV_m" : "Monthly RV (b_m)"}
 
-    hdr_nw = f"L={nw_lag} -- Corsi (2009) / Patton & Sheppard (2009)"
+    overlap  = HORIZONS[h]["overlap_lag"]
+    binds    = "overlap floor" if nw_lag == overlap else "NW-1994 plug-in"
+    hdr_nw   = f"L={nw_lag} [{binds}; 2*(h-1)={overlap}]"
     print_section(f"HAR-RV [RAW SCALE]  [{hlabel}]  Newey-West HAC  {hdr_nw}")
     print(f"{'Variable':<22} {'Coeff':>10} {'Std.Err':>10} {'t-stat':>10} "
           f"{'p-value':>10}  {'95% CI'}")
@@ -563,6 +657,14 @@ def print_diagnostics(diag: dict, h: int):
     print("  BP = Breusch-Pagan. A large statistic is EXPECTED in levels:")
     print("  RV residual variance scales with the level of RV. HAC standard")
     print("  errors remain valid; plain OLS SEs would be understated.")
+    if h > 1:
+        print(f"  DW/LB: rejection is MECHANICAL at h>1 -- the overlapping "
+              f"{h}-day\n  target induces MA({h-1}) residuals. The L="
+              f"{HORIZONS[h]['nw_lag']} bandwidth covers it.")
+    else:
+        print("  DW/LB: h=1 has no overlap, so any rejection here is genuine")
+        print(f"  serial correlation in the data -- the reason this horizon "
+              f"uses\n  L={HORIZONS[h]['nw_lag']} rather than L=0.")
 
 
 # ==============================================================================
@@ -810,12 +912,14 @@ def main(argv=None):
     # -- 10.0  Resolve command-line configuration -----------------------------
     args = parse_args(argv)
 
-    global DATA_FILE, OUT_DIR, TRAIN_END_YEAR, TEST_START_YEAR, QLIKE_FLOOR_FRAC
+    global DATA_FILE, OUT_DIR, TRAIN_END_YEAR, TEST_START_YEAR
+    global QLIKE_FLOOR_FRAC, NW_LAG_RULE
     DATA_FILE        = resolve_data_path(args.data)
     OUT_DIR          = args.outdir
     TRAIN_END_YEAR   = args.train_end_year
     TEST_START_YEAR  = args.test_start_year
     QLIKE_FLOOR_FRAC = args.qlike_floor_frac
+    NW_LAG_RULE      = args.nw_lag_rule
     os.makedirs(OUT_DIR, exist_ok=True)
 
     print(f"\n{SEP}")
@@ -935,6 +1039,11 @@ def main(argv=None):
       volatility proxies. Journal of Econometrics, 160(1), 246-256.
     Patton, A. J., & Sheppard, K. (2009). Evaluating volatility and
       correlation forecasts. Handbook of Financial Time Series. Springer.
+    Newey, W. K., & West, K. D. (1987). A simple, positive semi-definite,
+      heteroskedasticity and autocorrelation consistent covariance matrix.
+      Econometrica, 55(3), 703-708.
+    Newey, W. K., & West, K. D. (1994). Automatic lag selection in covariance
+      matrix estimation. Review of Economic Studies, 61(4), 631-653.
     Bollerslev, T., Patton, A. J., & Quaedvlieg, R. (2016). Exploiting
       the errors. Journal of Econometrics, 192(1), 1-18.
 """)
