@@ -1,6 +1,7 @@
 """
 ==============================================================================
-HAR-RV Model: Multi-Horizon Realized Volatility Forecasting  --  RAW RV SCALE
+HAR-RV Model: Multi-Horizon Realized Volatility Forecasting
+              RAW RV SCALE by default  |  ln(RV) SCALE with --log
 Based on: Corsi, F. (2009). A simple approximate long-memory model of
           realized volatility. Journal of Financial Econometrics, 7(2), 174-196.
 
@@ -24,9 +25,16 @@ USAGE (command line / notebook)
     python HAR-RV_RUN.PY                         # uses default data/EURUSD-RV.csv
     python HAR-RV_RUN.PY --data EURUSD_RV.CSV    # pick a data file
     python HAR-RV_RUN.PY --data path/to/my_rv.csv --outdir results
+    python HAR-RV_RUN.PY --log                   # same run on the ln(RV) scale
 
 In a Jupyter/Colab cell prefix with '!':
     !python HAR-RV_RUN.PY --data EURUSD_RV.CSV
+
+The two scales write to different filenames (har_rv_* vs har_rv_log_*), so
+running both back to back leaves both sets of results side by side:
+
+    python HAR-RV_RUN.PY --outdir results        # raw-scale results
+    python HAR-RV_RUN.PY --outdir results --log  # log-scale results
 
 The --data path is resolved leniently: if the exact path is not found the
 script also looks inside ./data and matches case-insensitively while treating
@@ -34,21 +42,71 @@ script also looks inside ./data and matches case-insensitively while treating
 'data/EURUSD-RV.csv'. Run `python HAR-RV_RUN.PY --help` for all options.
 
 ==============================================================================
-CHANGE FROM THE LOG VERSION -- everything now lives on the RAW RV scale.
+TWO SCALES, ONE PIPELINE
 
-This is Corsi (2009) eq. 3 in its original form, i.e. a LEVELS regression:
+DEFAULT (no flag) -- RAW RV. Corsi (2009) eq. 3 in its original form, i.e. a
+LEVELS regression:
 
     Target      Y_t^(h) = (1/h) * Sum_{k=1}^{h}  RV_{t+k}
     Regressors  RV_d    =            RV_{t-1}
                 RV_w    = (1/5)  * Sum_{k=1}^{5}  RV_{t-k}
                 RV_m    = (1/22) * Sum_{k=1}^{22} RV_{t-k}
 
-No logs are taken anywhere. The whole log-of-sum vs mean-of-logs discussion
-from the previous version is now moot -- there is no Jensen gap to worry
-about because there is no non-linear transform.
+No logs are taken anywhere in this mode, so there is no Jensen gap to worry
+about -- there is no non-linear transform.
 
-SUM vs MEAN is NOT cosmetic any more. On the log scale ln(sum) = ln(mean) +
-ln(window), a constant absorbed by the intercept. On the raw scale the two
+--log -- ln(RV). The log is applied to the SERIES FIRST, at load time, and the
+identical windows are then applied to the transformed series, so every HAR
+component is a MEAN OF LOGS:
+
+    x_t = ln(RV_t)
+
+    Target      Y_t^(h) = (1/h) * Sum_{k=1}^{h}  x_{t+k}
+    Regressors  x_d     =            x_{t-1}
+                x_w     = (1/5)  * Sum_{k=1}^{5}  x_{t-k}
+                x_m     = (1/22) * Sum_{k=1}^{22} x_{t-k}
+
+This is the log-HAR of Corsi (2009) sec. 3.2 and Andersen, Bollerslev &
+Diebold (2007). Everything downstream -- OLS, HAC covariance, diagnostics,
+figures, exports -- runs on x without further special-casing, because the
+loader hands the same four column names to the same code in both modes.
+
+MEAN OF LOGS vs LOG OF MEAN. These are different regressors and --log takes
+the first: (1/5)*Sum ln RV = ln(geometric mean), whereas ln((1/5)*Sum RV) =
+ln(arithmetic mean), and geometric <= arithmetic always. Log-first is the
+usual log-HAR convention and is the literal reading of "log the data, then
+compute". Two consequences worth knowing before reading the output:
+  * The h-day target under --log is the log of a GEOMETRIC forward mean. At
+    h=1 it coincides with the raw-mode target, RV_{t+1}; at h>1 it does not,
+    so back-transformed losses are exactly comparable across modes only at
+    h=1. At h>1 part of any gap is Jensen, not forecasting skill.
+  * SUM vs MEAN becomes cosmetic again on this scale: sums shift Y and the
+    regressors by the constant ln(window), which the intercept absorbs.
+
+WHAT --log CHANGES IN THE OUTPUT
+  1. MSE and MAE are reported in ln(RV) units -- the scale the model is
+     actually fitted on. They are NOT comparable to raw-scale losses. MSE_RV
+     and MAE_RV are also reported for cross-mode ranking (subject to the h>1
+     caveat above).
+  2. QLIKE is only defined for variances, so it is evaluated after mapping
+     the forecast back with the lognormal (Jensen) correction
+         E[RV | F] = exp( E[ln RV | F] + sigma^2 / 2 )
+     where sigma^2 is the TRAINING residual variance of the log regression.
+     Plain exp() returns the conditional MEDIAN and is biased low as a mean
+     estimate -- systematically, not just noisily. The uncorrected number is
+     printed alongside as QLIKE_naive so the size of the correction is
+     visible rather than taken on trust.
+  3. Non-positive forecasts become impossible: exp(.) > 0 always. The QLIKE
+     floor stays in the code but never binds, and 'neg pred' is 0 by
+     construction. This is the main practical gain over the levels fit.
+  4. Heteroskedasticity largely goes away -- compare the Breusch-Pagan
+     statistics across the two modes. Serial correlation does NOT, so the
+     Newey-West HAC covariance is still used, unchanged.
+  5. Outputs are written as har_rv_log_* instead of har_rv_*, so a --log run
+     never overwrites the raw-scale results it is meant to be compared with.
+
+SUM vs MEAN is NOT cosmetic in the DEFAULT raw mode. Under --log the two
+differ by ln(window), a constant the intercept absorbs; on the raw scale they
 differ by a MULTIPLICATIVE factor:
   * For the REGRESSORS it is still harmless -- using sums instead of means
     just rescales beta_w by 1/5 and beta_m by 1/22. Fit, residuals, R^2 and
@@ -58,7 +116,8 @@ differ by a MULTIPLICATIVE factor:
     MAE by h. R^2 is unchanged. Corsi's convention is the AVERAGE, used here,
     which also keeps the three horizons on a comparable scale.
 
-CONSEQUENCES OF WORKING IN LEVELS -- read before interpreting output:
+CONSEQUENCES OF WORKING IN LEVELS (default mode) -- read before interpreting
+output. Each of these is what --log exists to address:
   1. Residuals are severely heteroskedastic and right-skewed. RV has skew
      ~7.7 and excess kurtosis ~117 in this sample; volatility-of-volatility
      scales with the level of RV, so the error variance explodes in stress
@@ -75,13 +134,15 @@ CONSEQUENCES OF WORKING IN LEVELS -- read before interpreting output:
      reported per horizon, and floored before QLIKE is evaluated -- they are
      never silently dropped, since dropping the worst forecasts would bias
      QLIKE downward.
-  4. Losses are now on the RV scale, so they are NOT comparable to the
-     ln(RV)-scale numbers produced by the previous version of this script.
-     Any deep-learning baseline must be evaluated on the same scale.
+  4. Losses are on the RV scale, so they are NOT comparable to the ln(RV)-scale
+     numbers produced by --log. Any deep-learning baseline must be evaluated
+     on whichever scale is being reported.
 
-INPUT: the loader accepts either a raw 'RV' column (used as-is) or an
-'ln_RV' column (exponentiated back to raw RV once, at load time).
-Non-positive RV rows -- exchange holidays with no trading -- are dropped.
+INPUT: the loader accepts either a raw 'RV' column or an 'ln_RV' column, and
+converts once, in whichever direction the chosen mode needs -- so neither mode
+ever round-trips a value through exp() and log() unnecessarily.
+Non-positive RV rows -- exchange holidays with no trading -- are dropped. That
+drop is also what keeps --log defined at all, since ln(0) is not.
 
 HAC bandwidth -- Newey-West (1987) Bartlett kernel, L chosen as
 
@@ -127,7 +188,16 @@ components were inflated by 23% and 46% respectively.
 Pass --nw-lag-rule overlap to fall back to the pure L=2*(h-1) convention as
 a robustness check.
 
-Metrics   : MSE, MAE, QLIKE (Patton, 2011) -- computed on the RAW RV scale
+The bandwidth rule is scale-independent: the overlap floor is a property of
+the h-day target window and the plug-in term a property of the sample size,
+so --log gets the same L at each horizon. The standard errors quoted above
+are from the raw-scale fit; --log produces its own, generally tighter.
+
+Metrics
+  default : MSE, MAE, QLIKE (Patton, 2011), all on the RAW RV scale.
+  --log   : MSE, MAE in ln(RV) units; QLIKE on the back-transformed variance
+            (Jensen-corrected); MSE_RV, MAE_RV likewise back-transformed for
+            comparison against a raw-scale run.
 ==============================================================================
 """
 
@@ -160,6 +230,11 @@ from   scipy                               import stats
 DATA_FILE = "data/EURUSD-RV.csv"   # default data set (override with --data)
 OUT_DIR   = "."                    # where figures / CSVs are written (--outdir)
 
+# --log: transform RV -> ln(RV) at load time and run the ENTIRE pipeline on the
+# log scale (regressors, target, fit, losses, figures). False = raw RV levels,
+# the default and the behaviour of every previous version of this script.
+LOG_MODE = False
+
 # Mirrors data_provider/data_loader.py: VAL_END_YEAR = 2024, so the deep
 # models' train (<=2022) and val (2023-2024) years both become HAR training
 # data, and the test window (2025-end) is shared.
@@ -184,7 +259,8 @@ LAG_M    = 22   # monthly component window
 DPI_SAVE = 300
 
 # QLIKE guard: forecasts <= 0 are floored at this multiple of mean training RV
-# before QLIKE is evaluated. Reported, never silently dropped.
+# before QLIKE is evaluated. Reported, never silently dropped. Under --log the
+# level forecast is exp(.) > 0 by construction, so the floor never binds.
 QLIKE_FLOOR_FRAC = 1e-4
 
 # -- Publication palette ------------------------------------------------------
@@ -226,6 +302,50 @@ SAMPLE_END_YEAR   = None
 
 
 # ==============================================================================
+# 0a.  SCALE LABELS  (single source of truth for raw-vs-log wording)
+# ==============================================================================
+# The modelling columns keep the names RV / RV_d / RV_w / RV_m in BOTH modes --
+# under --log they simply hold ln(RV) instead of RV. Only the human-readable
+# labels and the output filenames switch, which keeps every regression, figure
+# and export path identical between the two modes.
+
+def scale_tag() -> str:
+    """Machine-readable scale identifier; goes in the metrics CSV."""
+    return "ln_RV" if LOG_MODE else "raw_RV"
+
+def scale_name() -> str:
+    """Short scale name for prose and axis labels."""
+    return "ln(RV)" if LOG_MODE else "raw RV"
+
+def scale_banner() -> str:
+    """Loud scale marker for section headers."""
+    return "LOG SCALE" if LOG_MODE else "RAW SCALE"
+
+def out_prefix() -> str:
+    """
+    Filename stem for figures and CSVs. Log-mode runs write har_rv_log_* so a
+    --log run never overwrites the raw-scale results it is meant to be compared
+    against (and vice versa).
+    """
+    return "har_rv_log" if LOG_MODE else "har_rv"
+
+def var_labels() -> dict:
+    """Coefficient row labels for the estimation table."""
+    unit = "ln RV" if LOG_MODE else "RV"
+    return {"const": "Intercept (b0)",
+            "RV_d" : f"Daily {unit}".ljust(10) + " (b_d)",
+            "RV_w" : f"Weekly {unit}".ljust(10) + " (b_w)",
+            "RV_m" : f"Monthly {unit}".ljust(10) + " (b_m)"}
+
+def coef_panel_labels() -> dict:
+    """Coefficient panel titles for the coefficient-path figure."""
+    unit = "ln RV" if LOG_MODE else ""
+    suff = f" {unit}".rstrip()
+    return {"const": "b0  (Intercept)",     "RV_d": f"b_d (Daily{suff})",
+            "RV_w" : f"b_w (Weekly{suff})", "RV_m": f"b_m (Monthly{suff})"}
+
+
+# ==============================================================================
 # 0b.  ARGUMENT PARSING & DATA-PATH RESOLUTION
 # ==============================================================================
 
@@ -237,7 +357,8 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(
         prog="HAR-RV_RUN.PY",
         description="HAR-RV multi-horizon realized-volatility forecasting "
-                    "(Corsi, 2009) on the raw RV scale.",
+                    "(Corsi, 2009). Runs on the raw RV scale by default, or on "
+                    "the ln(RV) scale with --log.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(
@@ -249,6 +370,16 @@ def parse_args(argv=None):
     p.add_argument(
         "--outdir", "-o", default=OUT_DIR, metavar="DIR",
         help="Directory for output figures and CSVs (created if missing).")
+    p.add_argument(
+        "--log", action="store_true", default=LOG_MODE,
+        help="Take logs FIRST, then do every computation on the log scale: the "
+             "RV series becomes ln(RV) at load time, so the HAR components and "
+             "the h-day target are all averages OF LOGS, the OLS fit is the "
+             "log-HAR of Corsi (2009) sec. 3.2 / Andersen et al. (2007), and "
+             "MSE/MAE are reported in ln(RV) units. QLIKE needs variances, so "
+             "it is evaluated after exp(), with the lognormal Jensen "
+             "correction. Outputs are written as har_rv_log_* so they do not "
+             "overwrite a raw-scale run.")
     p.add_argument(
         "--train-end-year", type=int, default=TRAIN_END_YEAR, metavar="YEAR",
         help="Last calendar year (inclusive) of the training sample.")
@@ -314,24 +445,52 @@ def resolve_data_path(path: str) -> str:
 
 def load_base_features(filepath: str) -> pd.DataFrame:
     """
-    Load the realized-variance series and build the three HAR regressors on
-    the RAW RV scale (Corsi 2009, eq. 3):
+    Load the realized-variance series and build the three HAR regressors.
+
+    RAW mode (default) -- Corsi (2009) eq. 3, a levels regression:
 
         RV_d = RV_{t-1}
         RV_w = (1/5)  * Sum_{k=1}^{5}  RV_{t-k}
         RV_m = (1/22) * Sum_{k=1}^{22} RV_{t-k}
 
+    LOG mode (--log) -- the log-HAR. The TRANSFORM COMES FIRST: the series
+    becomes x_t = ln(RV_t) at load time and the same three windows are then
+    applied to x, so every component is a MEAN OF LOGS:
+
+        x_d  = x_{t-1}                        = ln RV_{t-1}
+        x_w  = (1/5)  * Sum_{k=1}^{5}  x_{t-k}
+        x_m  = (1/22) * Sum_{k=1}^{22} x_{t-k}
+
+    Mean-of-logs vs log-of-mean. Both appear in the literature and they are
+    NOT the same regressor: (1/5)*Sum ln RV = ln( geometric mean ) whereas
+    ln( (1/5)*Sum RV ) = ln( arithmetic mean ), and by Jensen the former is
+    always the smaller of the two. This function implements mean-of-logs,
+    i.e. log first then aggregate, which is the usual log-HAR convention
+    (Andersen, Bollerslev, Diebold & Labys, 2003; Andersen, Bollerslev &
+    Diebold, 2007) and is exactly what --log asks for. Note that the earlier
+    "ln(sum) = ln(mean) + ln(window), absorbed by the intercept" remark in
+    the header applies to the log-of-aggregate family, not to this one -- for
+    mean-of-logs the window divisor really is just a constant, so sums and
+    means differ by ln(window) and the intercept absorbs it.
+
     Column handling
     ---------------
-    'RV'    -> used directly (this file's format).
-    'ln_RV' -> exponentiated once here, so everything downstream is raw.
+    'RV'    -> raw variance; logged here iff --log.
+    'ln_RV' -> already logged; used as-is under --log, exponentiated once for
+               raw mode (no needless exp/log round trip in either direction).
     Otherwise the first numeric column is taken and ASSUMED to be raw RV;
-    a warning is printed, because silently exponentiating the wrong column
+    a warning is printed, because silently transforming the wrong column
     is exactly the bug this loader is written to avoid.
 
     Non-positive RV rows are dropped: they are exchange holidays with no
-    trading rather than genuine zero-variance days, and a zero actual makes
-    QLIKE undefined.
+    trading rather than genuine zero-variance days. A zero actual makes QLIKE
+    undefined, and ln(RV) undefined as well -- so the drop is what keeps --log
+    well defined at all.
+
+    Both scales are returned. 'RV' carries the MODELLING series (ln(RV) under
+    --log, raw RV otherwise) and is what the regressors and target are built
+    from; 'RV_raw' always carries raw RV, and is used for the descriptive
+    summary and the QLIKE floor.
 
     All windows use shift(1), so the information set ends strictly at t-1 --
     no look-ahead. Regressors are IDENTICAL across horizons; only the target
@@ -347,27 +506,43 @@ def load_base_features(filepath: str) -> pd.DataFrame:
     raw = pd.read_csv(filepath, index_col=0, parse_dates=True)
     raw.index.name = "date"
 
+    ln_in = None   # pre-logged input column, when the file ships one
     if "RV" in raw.columns:
-        s = raw["RV"].sort_index().dropna().astype(float)
-        print("  Column 'RV' found -> used directly (already raw variance).")
+        s_raw = raw["RV"].sort_index().dropna().astype(float)
+        print("  Column 'RV' found -> raw realized variance.")
     elif "ln_RV" in raw.columns:
-        s = np.exp(raw["ln_RV"].sort_index().dropna().astype(float))
-        print("  Column 'ln_RV' found -> exponentiated once to raw RV.")
+        ln_in = raw["ln_RV"].sort_index().dropna().astype(float)
+        s_raw = np.exp(ln_in)
+        print("  Column 'ln_RV' found -> already on the log scale.")
     else:
-        col = raw.select_dtypes("number").columns[0]
-        s = raw[col].sort_index().dropna().astype(float)
+        col   = raw.select_dtypes("number").columns[0]
+        s_raw = raw[col].sort_index().dropna().astype(float)
         print(f"  WARNING: no 'RV'/'ln_RV' column. Using '{col}' AS RAW RV.")
 
-    n_bad = int((s <= 0).sum())
+    n_bad = int((s_raw <= 0).sum())
     if n_bad:
         print(f"  Dropped {n_bad} non-positive RV row(s) (non-trading days): "
-              f"{[str(d.date()) for d in s.index[s <= 0]]}")
-        s = s[s > 0]
+              f"{[str(d.date()) for d in s_raw.index[s_raw <= 0]]}")
+        s_raw = s_raw[s_raw > 0]
+        if ln_in is not None:
+            ln_in = ln_in.reindex(s_raw.index)
+
+    # THE TRANSFORM. Everything downstream -- windows, target, OLS, losses --
+    # operates on `s`, so taking the log here is what puts the whole pipeline
+    # on the log scale.
+    if LOG_MODE:
+        s = ln_in if ln_in is not None else np.log(s_raw)
+        print("  --log: series transformed to ln(RV) BEFORE any aggregation, so")
+        print("         RV_d/RV_w/RV_m and Y_h below are all MEANS OF LOGS.")
+    else:
+        s = s_raw
+        if ln_in is not None:
+            print("  Exponentiated once to raw RV (raw mode).")
 
     SAMPLE_START_YEAR = int(s.index[0].year)
     SAMPLE_END_YEAR   = int(s.index[-1].year)
 
-    df = pd.DataFrame({"RV": s})
+    df = pd.DataFrame({"RV": s, "RV_raw": s_raw})
     df["RV_d"] = s.shift(1)
     df["RV_w"] = s.shift(1).rolling(LAG_W).mean()
     df["RV_m"] = s.shift(1).rolling(LAG_M).mean()
@@ -380,12 +555,20 @@ def load_base_features(filepath: str) -> pd.DataFrame:
 
 def build_horizon_target(df_base: pd.DataFrame, h: int) -> pd.DataFrame:
     """
-    Construct the h-day forward AVERAGE realized variance as the dependent
-    variable -- Corsi (2009) eq. 3, raw scale:
+    Construct the h-day forward AVERAGE of the modelling series as the
+    dependent variable -- Corsi (2009) eq. 3:
 
-        Y_t^(h) = (1/h) * Sum_{k=1}^{h} RV_{t+k}
+        raw  :  Y_t^(h) = (1/h) * Sum_{k=1}^{h} RV_{t+k}
+        --log:  Y_t^(h) = (1/h) * Sum_{k=1}^{h} ln RV_{t+k}
 
-    For h = 1 this collapses to RV_t itself.
+    For h = 1 both collapse to the one-day value, RV_t or ln RV_t.
+
+    The code is scale-agnostic: it averages df_base['RV'], which the loader
+    has already put on the requested scale. Under --log the average of logs
+    is the log of the GEOMETRIC mean of forward RV, not of the arithmetic
+    mean -- the two differ by Jensen's inequality and only coincide at h=1.
+    This matters when reading back-transformed losses, so it is flagged again
+    in compute_metrics() and in the metrics table.
 
     Window convention: rolling(h).mean().shift(-(h-1)) spans t ... t+h-1.
     Every regressor is shifted by one day, so the information set ends at
@@ -393,8 +576,10 @@ def build_horizon_target(df_base: pd.DataFrame, h: int) -> pd.DataFrame:
     no look-ahead, indexed one day earlier than the formula above.
 
     Using the h-day SUM instead would multiply Y, all coefficients and all
-    residuals by h (MSE by h^2). R^2 is invariant, but reported losses are
-    not -- hence the average, which is also Corsi's convention.
+    residuals by h (MSE by h^2) on the raw scale; on the log scale it would
+    shift Y by the constant ln(h), which the intercept absorbs. R^2 is
+    invariant either way, but reported raw-scale losses are not -- hence the
+    average, which is also Corsi's convention.
     """
     df = df_base.copy()
     if h == 1:
@@ -463,14 +648,20 @@ def nw_bandwidth(h: int, nobs: int, rule: str = "auto") -> int:
 
 def fit_har_rv(train: pd.DataFrame, h: int):
     """
-    Estimate HAR-RV by OLS in LEVELS for forecast horizon h.
+    Estimate HAR-RV by OLS for forecast horizon h -- in LEVELS by default, or
+    on the log scale under --log:
 
-        Y_t^(h) = b0 + b_d*RV_d + b_w*RV_w + b_m*RV_m + e_t
+        raw  :  Y_t^(h) = b0 + b_d*RV_d   + b_w*RV_w   + b_m*RV_m   + e_t
+        --log:  Y_t^(h) = b0 + b_d*x_d    + b_w*x_w    + b_m*x_m    + e_t
+                where x = ln(RV) and Y^(h) is the forward mean of logs.
 
     Standard errors are Newey-West (1987) HAC with the bandwidth from
-    nw_bandwidth(). The HAC estimator is doing more work here than in the log
-    version: raw-RV residuals are strongly heteroskedastic, and Newey-West
-    corrects for that as well as for the autocorrelation.
+    nw_bandwidth(). The HAC estimator is doing more work in levels than under
+    --log: raw-RV residuals are strongly heteroskedastic, and Newey-West
+    corrects for that as well as for the autocorrelation. Logging shrinks the
+    heteroskedasticity a long way (compare the Breusch-Pagan statistics
+    between the two modes) but does not remove the serial correlation, so HAC
+    is still the right covariance under --log.
 
     Caution when reading the code: statsmodels' cov_type="HAC" with maxlags=0
     is NOT classical OLS -- the Bartlett kernel retains only the j=0 term, so
@@ -491,7 +682,10 @@ def fit_har_rv(train: pd.DataFrame, h: int):
 
 
 # ==============================================================================
-# 5.  LOSS FUNCTIONS   (all on the RAW RV scale)
+# 5.  LOSS FUNCTIONS
+#     Raw mode : everything on the RAW RV scale.
+#     --log    : MSE/MAE in ln(RV) units (the scale the model is fitted on),
+#                QLIKE after exp() because QLIKE is only defined for variances.
 # ==============================================================================
 
 def mse(actual: np.ndarray, predicted: np.ndarray) -> float:
@@ -522,13 +716,70 @@ def qlike(actual: np.ndarray, predicted: np.ndarray, floor: float):
     ratio     = actual[valid] / pred_safe[valid]
     return float(np.mean(ratio - np.log(ratio) - 1)), n_bad
 
-def compute_metrics(actual, predicted, floor: float) -> dict:
-    q, n_bad = qlike(actual, predicted, floor)
-    return {"MSE"       : mse(actual, predicted),
-            "MAE"       : mae(actual, predicted),
-            "QLIKE"     : q,
-            "n_neg_pred": n_bad,
-            "pct_neg"   : 100.0 * n_bad / len(predicted)}
+def back_transform(pred_log: np.ndarray, resid_var: float) -> np.ndarray:
+    """
+    Map a log-scale forecast back to a variance, with the lognormal (Jensen)
+    correction:
+
+        E[RV | F] = exp( E[ln RV | F] + sigma^2 / 2 )
+
+    Taking exp() alone returns the conditional MEDIAN, which understates the
+    conditional mean by exp(sigma^2/2) -- a systematic downward bias, not
+    noise, and it does not average out over the sample. `resid_var` is the
+    training residual variance of the log regression; the correction is exact
+    when the log residuals are Gaussian and a good approximation otherwise
+    (Andersen, Bollerslev, Diebold & Labys, 2003).
+
+    The result is strictly positive, which is why --log cannot produce the
+    non-positive variance forecasts the levels regression does.
+    """
+    return np.exp(np.asarray(pred_log, dtype=float) + resid_var / 2.0)
+
+
+def compute_metrics(actual, predicted, floor: float,
+                    resid_var: float = 0.0) -> dict:
+    """
+    Losses for one split. `actual` / `predicted` are on the MODELLING scale.
+
+    Raw mode: MSE, MAE and QLIKE are all raw-RV losses, exactly as before.
+
+    --log mode:
+      * MSE / MAE are in ln(RV) units -- the scale the model is fitted and
+        should be judged on. Squared error in logs is a relative-error
+        criterion and is not spike-dominated the way levels MSE is.
+      * QLIKE is undefined on logs (it needs a variance ratio), so both sides
+        are exponentiated first: actual exp(Y_h), forecast back_transform(.).
+        Both sides are the same object, so the comparison is internally
+        consistent -- at h=1 the pair is literally (RV, RV_hat).
+      * MSE_RV / MAE_RV repeat the errors on the back-transformed variance
+        scale, so a --log run can be ranked against a raw run. At h=1 that
+        comparison is exact. At h>1 the log target is a geometric mean while
+        the raw target is an arithmetic mean, so the two runs are forecasting
+        slightly different objects and the gap is a Jensen gap, not skill.
+      * QLIKE_naive is QLIKE without the Jensen correction, reported so the
+        size of the correction is visible rather than taken on trust.
+    """
+    if not LOG_MODE:
+        q, n_bad = qlike(actual, predicted, floor)
+        return {"MSE"       : mse(actual, predicted),
+                "MAE"       : mae(actual, predicted),
+                "QLIKE"     : q,
+                "n_neg_pred": n_bad,
+                "pct_neg"   : 100.0 * n_bad / len(predicted)}
+
+    actual_lvl    = np.exp(np.asarray(actual, dtype=float))
+    pred_naive    = np.exp(np.asarray(predicted, dtype=float))
+    pred_lvl      = back_transform(predicted, resid_var)
+    q,       n_bad = qlike(actual_lvl, pred_lvl,   floor)
+    q_naive, _     = qlike(actual_lvl, pred_naive, floor)
+    return {"MSE"        : mse(actual, predicted),      # ln(RV) units
+            "MAE"        : mae(actual, predicted),      # ln(RV) units
+            "QLIKE"      : q,                           # back-transformed
+            "QLIKE_naive": q_naive,
+            "MSE_RV"     : mse(actual_lvl, pred_lvl),
+            "MAE_RV"     : mae(actual_lvl, pred_lvl),
+            "n_neg_pred" : n_bad,                       # 0 by construction
+            "pct_neg"    : 100.0 * n_bad / len(predicted)}
 
 
 # ==============================================================================
@@ -544,6 +795,13 @@ def residual_diagnostics(result, lags: int = 20) -> dict:
     statistic is expected, not a sign of a coding error. It confirms that
     the HAC/robust covariance is doing necessary work and that plain OLS
     standard errors would be understated.
+
+    Under --log the same statistics are computed on the log-scale residuals,
+    where they read very differently: BP falls by orders of magnitude and
+    Jarque-Bera improves sharply, because logging is what turns the
+    multiplicative volatility-of-volatility into something close to additive
+    noise. Comparing the two modes' diagnostics is the cleanest way to see
+    what the transform buys.
     """
     residuals     = result.resid
     dw            = durbin_watson(residuals)
@@ -591,15 +849,13 @@ def print_estimation_table(result, h: int):
     params, bse   = result.params, result.bse
     tvals, pvals  = result.tvalues, result.pvalues
     ci       = result.conf_int(alpha=0.05)
-    name_map = {"const": "Intercept (b0)",
-                "RV_d" : "Daily RV   (b_d)",
-                "RV_w" : "Weekly RV  (b_w)",
-                "RV_m" : "Monthly RV (b_m)"}
+    name_map = var_labels()
 
     overlap  = HORIZONS[h]["overlap_lag"]
     binds    = "overlap floor" if nw_lag == overlap else "NW-1994 plug-in"
     hdr_nw   = f"L={nw_lag} [{binds}; 2*(h-1)={overlap}]"
-    print_section(f"HAR-RV [RAW SCALE]  [{hlabel}]  Newey-West HAC  {hdr_nw}")
+    print_section(f"HAR-RV [{scale_banner()}]  [{hlabel}]  "
+                  f"Newey-West HAC  {hdr_nw}")
     print(f"{'Variable':<22} {'Coeff':>10} {'Std.Err':>10} {'t-stat':>10} "
           f"{'p-value':>10}  {'95% CI'}")
     print(THIN)
@@ -611,8 +867,13 @@ def print_estimation_table(result, h: int):
               f"[{ci.loc[var,0]:7.4f}, {ci.loc[var,1]:7.4f}]{sig}")
     print(THIN)
     print("Significance: *** p<0.01  ** p<0.05  * p<0.10")
-    print("Coefficients are unit-free (RV regressed on RV), so b_d+b_w+b_m")
+    if LOG_MODE:
+        print("Coefficients are elasticities (ln RV on ln RV), so b_d+b_w+b_m")
+    else:
+        print("Coefficients are unit-free (RV regressed on RV), so b_d+b_w+b_m")
     print("near 1 indicates a near-unit-root / long-memory persistence.")
+    b_sum = float(sum(result.params[v] for v in ("RV_d", "RV_w", "RV_m")))
+    print(f"  b_d+b_w+b_m  : {b_sum:.4f}")
     print(f"\n  R2           : {result.rsquared:.4f}")
     print(f"  Adj. R2      : {result.rsquared_adj:.4f}")
     print(f"  F-statistic  : {result.fvalue:.3f}   [p = {result.f_pvalue:.4f}]")
@@ -621,42 +882,74 @@ def print_estimation_table(result, h: int):
 
 def print_metrics_by_horizon(all_metrics: dict):
     print_section(f"OUT-OF-SAMPLE FORECAST EVALUATION -- ALL HORIZONS  "
-                  f"(Test {TEST_START_YEAR}-{SAMPLE_END_YEAR})")
-    print(f"  {'Metric':<10}", end="")
+                  f"[{scale_banner()}]  (Test {TEST_START_YEAR}-{SAMPLE_END_YEAR})")
+    print(f"  {'Metric':<12}", end="")
     for h in HORIZONS:
         print(f"  {HORIZONS[h]['label']:>20}", end="")
     print()
     print(THIN)
-    for metric in ["MSE", "MAE", "QLIKE"]:
-        print(f"  {metric:<10}", end="")
+
+    # Row label carries the units, because under --log the rows of this one
+    # table are deliberately on two different scales.
+    rows = ([("MSE  [ln]", "MSE"), ("MAE  [ln]", "MAE"),
+             ("QLIKE [RV]", "QLIKE"), ("MSE_RV", "MSE_RV"), ("MAE_RV", "MAE_RV")]
+            if LOG_MODE else
+            [("MSE", "MSE"), ("MAE", "MAE"), ("QLIKE", "QLIKE")])
+    for label, key in rows:
+        print(f"  {label:<12}", end="")
         for h in HORIZONS:
-            print(f"  {all_metrics[h]['test'][metric]:>20.6f}", end="")
+            print(f"  {all_metrics[h]['test'][key]:>20.6f}", end="")
         print()
-    print(f"  {'neg pred':<10}", end="")
+
+    print(f"  {'neg pred':<12}", end="")
     for h in HORIZONS:
         m = all_metrics[h]["test"]
         cell = f"{m['n_neg_pred']} ({m['pct_neg']:.1f}%)"
         print(f"  {cell:>20}", end="")
     print()
     print(THIN)
-    print("  Note: All metrics on the RAW RV scale -- NOT comparable to the")
-    print("        ln(RV)-scale losses from the log version of this script.")
-    print("        MSE in levels is dominated by a few spike days; MAE and")
-    print("        QLIKE (Patton, 2011) are the more robust rankings here.")
-    print("        'neg pred' counts non-positive forecasts, floored before")
-    print("        QLIKE. A large count means QLIKE leans on that floor.")
+    if LOG_MODE:
+        print("  Note: MSE/MAE marked [ln] are in ln(RV) units -- the scale the")
+        print("        model is fitted on -- and are NOT comparable to raw-scale")
+        print("        losses. Squared error in logs is a relative criterion, so")
+        print("        it is far less spike-dominated than levels MSE.")
+        print("        QLIKE needs variances, so it is evaluated after exp() with")
+        print("        the Jensen correction; MSE_RV/MAE_RV are the same forecasts")
+        print("        on that back-transformed variance scale, for ranking against")
+        print("        a raw-scale run. That ranking is exact at h=1 only: at h>1")
+        print("        the log target is a GEOMETRIC forward mean and the raw one")
+        print("        an ARITHMETIC forward mean, so the two are forecasting")
+        print("        different objects and geometric <= arithmetic always.")
+        print("        'neg pred' is 0 by construction here -- exp() cannot return")
+        print("        a non-positive variance. That is the main practical gain")
+        print("        over the levels fit.")
+    else:
+        print("  Note: All metrics on the RAW RV scale -- NOT comparable to the")
+        print("        ln(RV)-scale losses produced by --log.")
+        print("        MSE in levels is dominated by a few spike days; MAE and")
+        print("        QLIKE (Patton, 2011) are the more robust rankings here.")
+        print("        'neg pred' counts non-positive forecasts, floored before")
+        print("        QLIKE. A large count means QLIKE leans on that floor.")
 
 def print_diagnostics(diag: dict, h: int):
     print_section(f"RESIDUAL DIAGNOSTICS  [h={h}, {HORIZONS[h]['label']}, "
+                  f"{scale_name()} residuals, "
                   f"Training Sample {SAMPLE_START_YEAR}-{TRAIN_END_YEAR}]")
     print(f"  {'Statistic':<30} {'Value':>12}")
     print(THIN)
     for k, v in diag.items():
         print(f"  {k:<30} {v:>12.4f}")
     print(THIN)
-    print("  BP = Breusch-Pagan. A large statistic is EXPECTED in levels:")
-    print("  RV residual variance scales with the level of RV. HAC standard")
-    print("  errors remain valid; plain OLS SEs would be understated.")
+    if LOG_MODE:
+        print("  BP = Breusch-Pagan, on ln(RV) residuals. Logging absorbs most of")
+        print("  the level-dependent error variance, so BP here is far smaller")
+        print("  than in the levels fit -- that gain is the point of --log. HAC")
+        print("  is still used: it also covers the serial correlation, which the")
+        print("  transform does NOT remove.")
+    else:
+        print("  BP = Breusch-Pagan. A large statistic is EXPECTED in levels:")
+        print("  RV residual variance scales with the level of RV. HAC standard")
+        print("  errors remain valid; plain OLS SEs would be understated.")
     if h > 1:
         print(f"  DW/LB: rejection is MECHANICAL at h>1 -- the overlapping "
               f"{h}-day\n  target induces MA({h-1}) residuals. The L="
@@ -672,6 +965,9 @@ def print_diagnostics(diag: dict, h: int):
 # ==============================================================================
 
 def _ylab(h):
+    if LOG_MODE:
+        return (r"$\ln RV_t$" if h == 1
+                else rf"$\overline{{\ln RV}}_{{t,t+{h}}}$")
     return (r"$RV_t$" if h == 1
             else rf"$\overline{{RV}}_{{t,t+{h}}}$")
 
@@ -694,8 +990,11 @@ def figure_multi_horizon_forecast(results_dict):
                 label=f"HAR-RV  h={h}")
         ax.fill_between(t_idx, actual.values, pred.values,
                         color="#aaaaaa", alpha=0.18, label="Error")
-        # Zero line matters in levels: forecasts can cross it.
-        ax.axhline(0, color="black", lw=0.6, alpha=0.6)
+        # Zero line matters in levels, where forecasts can cross it into
+        # meaningless negative variance. On the log scale zero is just RV=1,
+        # an arbitrary point the series straddles anyway, so it is dropped.
+        if not LOG_MODE:
+            ax.axhline(0, color="black", lw=0.6, alpha=0.6)
         ax.set_ylabel(_ylab(h), fontsize=10)
         ax.set_title(f"{panel_letters[idx]}  {HORIZONS[h]['label']} -- "
                      f"Out-of-Sample Forecast ({TEST_START_YEAR}-{SAMPLE_END_YEAR})",
@@ -707,13 +1006,15 @@ def figure_multi_horizon_forecast(results_dict):
         ax.legend(loc="upper right", fontsize=8)
         plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha="right")
 
-    fig.suptitle(f"HAR-RV (raw RV) Multi-Horizon Forecasts: h = 1, 5, 22  (Corsi, 2009)\n"
+    fig.suptitle(f"HAR-RV ({scale_name()}) Multi-Horizon Forecasts: "
+                 f"h = 1, 5, 22  (Corsi, 2009)\n"
                  f"Train: {SAMPLE_START_YEAR}-{TRAIN_END_YEAR}  |  "
                  f"Test: {TEST_START_YEAR}-{SAMPLE_END_YEAR}",
                  fontsize=12, fontweight="bold", y=1.01)
+    stem = f"{out_prefix()}_fig1_multihoriz_forecast"
     for ext in ("pdf", "png"):
-        fig.savefig(f"{OUT_DIR}/har_rv_fig1_multihoriz_forecast.{ext}", bbox_inches="tight")
-    print("  -> Saved: har_rv_fig1_multihoriz_forecast.pdf / .png")
+        fig.savefig(f"{OUT_DIR}/{stem}.{ext}", bbox_inches="tight")
+    print(f"  -> Saved: {stem}.pdf / .png")
     plt.close(fig)
 
 
@@ -734,24 +1035,27 @@ def figure_loss_comparison(all_metrics: dict):
         for bar, v in zip(bars, vals):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() * 1.015,
                     f"{v:.4f}", ha="center", va="bottom", fontsize=8)
+        # QLIKE is always a variance-scale loss; MSE/MAE follow the fit scale.
+        unit = ("ln(RV) scale" if LOG_MODE and metric != "QLIKE"
+                else "RV scale")
         ax.set_title(f"{panel_letters[idx]}  {metric}", loc="left", pad=3)
-        ax.set_ylabel(f"{metric}  (raw RV scale)")
+        ax.set_ylabel(f"{metric}  ({unit})")
         ax.set_xlabel("Forecast Horizon")
         ax.yaxis.set_minor_locator(AutoMinorLocator())
 
-    fig.suptitle(f"HAR-RV (raw RV): Out-of-Sample Loss by Horizon -- "
+    fig.suptitle(f"HAR-RV ({scale_name()}): Out-of-Sample Loss by Horizon -- "
                  f"Test {TEST_START_YEAR}-{SAMPLE_END_YEAR}",
                  fontsize=12, fontweight="bold")
+    stem = f"{out_prefix()}_fig2_loss_comparison"
     for ext in ("pdf", "png"):
-        fig.savefig(f"{OUT_DIR}/har_rv_fig2_loss_comparison.{ext}", bbox_inches="tight")
-    print("  -> Saved: har_rv_fig2_loss_comparison.pdf / .png")
+        fig.savefig(f"{OUT_DIR}/{stem}.{ext}", bbox_inches="tight")
+    print(f"  -> Saved: {stem}.pdf / .png")
     plt.close(fig)
 
 
 def figure_coefficients_across_horizons(results_dict: dict):
     horizons   = list(HORIZONS.keys())
-    coef_names = {"const": "b0  (Intercept)", "RV_d": "b_d (Daily)",
-                  "RV_w" : "b_w (Weekly)",    "RV_m": "b_m (Monthly)"}
+    coef_names = coef_panel_labels()
     x_pos         = np.arange(len(horizons))
     x_labels      = [f"h={h}" for h in horizons]
     panel_letters = ["(A)", "(B)", "(C)", "(D)"]
@@ -774,11 +1078,13 @@ def figure_coefficients_across_horizons(results_dict: dict):
         ax.yaxis.set_minor_locator(AutoMinorLocator())
         ax.legend(fontsize=8)
 
-    fig.suptitle("HAR-RV (raw RV): Coefficient Paths Across Horizons  (h = 1, 5, 22)",
+    fig.suptitle(f"HAR-RV ({scale_name()}): Coefficient Paths Across Horizons  "
+                 f"(h = 1, 5, 22)",
                  fontsize=12, fontweight="bold", y=1.01)
+    stem = f"{out_prefix()}_fig3_coeff_paths"
     for ext in ("pdf", "png"):
-        fig.savefig(f"{OUT_DIR}/har_rv_fig3_coeff_paths.{ext}", bbox_inches="tight")
-    print("  -> Saved: har_rv_fig3_coeff_paths.pdf / .png")
+        fig.savefig(f"{OUT_DIR}/{stem}.{ext}", bbox_inches="tight")
+    print(f"  -> Saved: {stem}.pdf / .png")
     plt.close(fig)
 
 
@@ -812,12 +1118,14 @@ def figure_residual_diagnostics_multihoriz(results_dict: dict):
         ax.yaxis.set_minor_locator(AutoMinorLocator())
         ax.legend(fontsize=8)
 
-    fig.suptitle(f"HAR-RV (raw RV): ACF of Squared Residuals -- Training Sample "
-                 f"{SAMPLE_START_YEAR}-{TRAIN_END_YEAR}  (vertical line = NW bandwidth)",
+    fig.suptitle(f"HAR-RV ({scale_name()}): ACF of Squared Residuals -- Training "
+                 f"Sample {SAMPLE_START_YEAR}-{TRAIN_END_YEAR}  "
+                 f"(vertical line = NW bandwidth)",
                  fontsize=11, fontweight="bold")
+    stem = f"{out_prefix()}_fig4_acf_residuals"
     for ext in ("pdf", "png"):
-        fig.savefig(f"{OUT_DIR}/har_rv_fig4_acf_residuals.{ext}", bbox_inches="tight")
-    print("  -> Saved: har_rv_fig4_acf_residuals.pdf / .png")
+        fig.savefig(f"{OUT_DIR}/{stem}.{ext}", bbox_inches="tight")
+    print(f"  -> Saved: {stem}.pdf / .png")
     plt.close(fig)
 
 
@@ -841,8 +1149,11 @@ def figure_scatter_grid(results_dict: dict):
         xs = np.array([lo, hi])
         ax.plot(xs, intercept + slope * xs, color=C_TEST, lw=1.0,
                 label=f"OLS fit  R2={r**2:.3f}")
-        # In levels the negative-forecast region is meaningful; shade it.
-        if lo < 0:
+        # In levels the negative-forecast region is meaningful; shade it. Under
+        # --log a negative axis value is just RV_hat < 1, which is most of the
+        # sample and no kind of failure, so the shading is suppressed -- keeping
+        # it would flag ordinary forecasts as invalid.
+        if lo < 0 and not LOG_MODE:
             ax.axvspan(lo, 0, color="#d73027", alpha=0.08)
             ax.axvline(0, color="#d73027", lw=0.8, ls=":", label="RV_hat = 0")
         ax.set_xlabel(f"Predicted  {_ylab(h)}", fontsize=9)
@@ -853,12 +1164,13 @@ def figure_scatter_grid(results_dict: dict):
         ax.xaxis.set_minor_locator(AutoMinorLocator())
         ax.yaxis.set_minor_locator(AutoMinorLocator())
 
-    fig.suptitle(f"HAR-RV (raw RV): Actual vs. Predicted -- Test "
+    fig.suptitle(f"HAR-RV ({scale_name()}): Actual vs. Predicted -- Test "
                  f"{TEST_START_YEAR}-{SAMPLE_END_YEAR}  (all horizons)",
                  fontsize=12, fontweight="bold")
+    stem = f"{out_prefix()}_fig5_scatter_grid"
     for ext in ("pdf", "png"):
-        fig.savefig(f"{OUT_DIR}/har_rv_fig5_scatter_grid.{ext}", bbox_inches="tight")
-    print("  -> Saved: har_rv_fig5_scatter_grid.pdf / .png")
+        fig.savefig(f"{OUT_DIR}/{stem}.{ext}", bbox_inches="tight")
+    print(f"  -> Saved: {stem}.pdf / .png")
     plt.close(fig)
 
 
@@ -867,31 +1179,52 @@ def figure_scatter_grid(results_dict: dict):
 # ==============================================================================
 
 def export_all(results_dict: dict, all_metrics: dict):
+    """
+    Write fitted values, metrics and parameter tables.
+
+    Filenames are prefixed by out_prefix(), so a --log run writes har_rv_log_*
+    alongside (not on top of) the raw-scale har_rv_* files. Y_h / fitted /
+    residual are on the fit scale; under --log two extra columns give the
+    back-transformed variance forecast so the CSV is usable without re-deriving
+    the Jensen correction downstream.
+    """
+    pfx = out_prefix()
+
     # -- 9a. Fitted values (one CSV per horizon) ------------------------------
     for h, res in results_dict.items():
-        out = res["df_train"][["Y_h"]].copy()
-        out["fitted"]   = res["y_hat_train"].values
-        out["residual"] = out["Y_h"] - out["fitted"]
-        out["split"]    = "train"
-        test_out = res["df_test"][["Y_h"]].copy()
-        test_out["fitted"]   = res["y_hat_test"].values
-        test_out["residual"] = test_out["Y_h"] - test_out["fitted"]
-        test_out["split"]    = "test"
-        full  = pd.concat([out, test_out]).sort_index()
-        fname = f"{OUT_DIR}/har_rv_h{h:02d}_fitted.csv"
-        full.to_csv(fname)
-        print(f"  -> Saved: har_rv_h{h:02d}_fitted.csv")
+        frames = []
+        for split, dkey, pkey in (("train", "df_train", "y_hat_train"),
+                                  ("test",  "df_test",  "y_hat_test")):
+            part = res[dkey][["Y_h"]].copy()
+            part["fitted"]   = res[pkey].values
+            part["residual"] = part["Y_h"] - part["fitted"]
+            if LOG_MODE:
+                # Same objects the QLIKE / MSE_RV numbers are computed from.
+                part["actual_RV"]  = np.exp(part["Y_h"])
+                part["fitted_RV"]  = back_transform(part["fitted"].values,
+                                                    res["resid_var"])
+            part["split"] = split
+            frames.append(part)
+        full  = pd.concat(frames).sort_index()
+        fname = f"{pfx}_h{h:02d}_fitted.csv"
+        full.to_csv(f"{OUT_DIR}/{fname}")
+        print(f"  -> Saved: {fname}")
 
     # -- 9b. Consolidated metrics table ---------------------------------------
-    rows = []
+    # 'scale' records which scale MSE/MAE are in, so raw and --log runs can be
+    # concatenated later without losing track of the units.
+    extra = ["QLIKE_naive", "MSE_RV", "MAE_RV"] if LOG_MODE else []
+    rows  = []
     for h in results_dict:
         for split in ["train", "test"]:
-            m = all_metrics[h][split]
-            rows.append({"horizon": h, "split": split, "scale": "raw_RV",
-                         "MSE": m["MSE"], "MAE": m["MAE"], "QLIKE": m["QLIKE"],
-                         "n_neg_pred": m["n_neg_pred"], "pct_neg": m["pct_neg"]})
-    pd.DataFrame(rows).to_csv(f"{OUT_DIR}/har_rv_all_metrics.csv", index=False)
-    print("  -> Saved: har_rv_all_metrics.csv")
+            m   = all_metrics[h][split]
+            row = {"horizon": h, "split": split, "scale": scale_tag(),
+                   "MSE": m["MSE"], "MAE": m["MAE"], "QLIKE": m["QLIKE"]}
+            row.update({k: m[k] for k in extra})
+            row.update({"n_neg_pred": m["n_neg_pred"], "pct_neg": m["pct_neg"]})
+            rows.append(row)
+    pd.DataFrame(rows).to_csv(f"{OUT_DIR}/{pfx}_all_metrics.csv", index=False)
+    print(f"  -> Saved: {pfx}_all_metrics.csv")
 
     # -- 9c. Parameter tables (one CSV per horizon) ---------------------------
     for h, res in results_dict.items():
@@ -900,8 +1233,8 @@ def export_all(results_dict: dict, all_metrics: dict):
         pd.DataFrame({"Coefficient": result.params, "Std_Error": result.bse,
                       "t_stat": result.tvalues, "p_value": result.pvalues,
                       "CI_lower": ci[0], "CI_upper": ci[1]}
-                     ).to_csv(f"{OUT_DIR}/har_rv_h{h:02d}_params.csv")
-        print(f"  -> Saved: har_rv_h{h:02d}_params.csv")
+                     ).to_csv(f"{OUT_DIR}/{pfx}_h{h:02d}_params.csv")
+        print(f"  -> Saved: {pfx}_h{h:02d}_params.csv")
 
 
 # ==============================================================================
@@ -913,19 +1246,25 @@ def main(argv=None):
     args = parse_args(argv)
 
     global DATA_FILE, OUT_DIR, TRAIN_END_YEAR, TEST_START_YEAR
-    global QLIKE_FLOOR_FRAC, NW_LAG_RULE
+    global QLIKE_FLOOR_FRAC, NW_LAG_RULE, LOG_MODE
     DATA_FILE        = resolve_data_path(args.data)
     OUT_DIR          = args.outdir
     TRAIN_END_YEAR   = args.train_end_year
     TEST_START_YEAR  = args.test_start_year
     QLIKE_FLOOR_FRAC = args.qlike_floor_frac
     NW_LAG_RULE      = args.nw_lag_rule
+    LOG_MODE         = args.log
     os.makedirs(OUT_DIR, exist_ok=True)
 
     print(f"\n{SEP}")
-    print("  HAR-RV MULTI-HORIZON MODEL  --  Corsi (2009)  --  RAW RV SCALE")
+    print(f"  HAR-RV MULTI-HORIZON MODEL  --  Corsi (2009)  --  {scale_banner()}")
     print("  EUR/USD Realized Variance  |  Horizons: h = 1, 5, 22")
-    print("  Aggregation: arithmetic averages of RV on BOTH sides -- no logs")
+    if LOG_MODE:
+        print("  --log: RV -> ln(RV) first, then arithmetic averages of LOGS on")
+        print("         BOTH sides. MSE/MAE in ln(RV) units; QLIKE after exp().")
+    else:
+        print("  Aggregation: arithmetic averages of RV on BOTH sides -- no logs")
+        print("  (pass --log to run the same pipeline on the ln(RV) scale)")
     print(SEP)
 
     # -- 10.1  Load base features ---------------------------------------------
@@ -935,17 +1274,29 @@ def main(argv=None):
     df_base = load_base_features(DATA_FILE)
     print(f"  Full series  : {df_base.index[0].date()} -> {df_base.index[-1].date()}")
     print(f"  Total rows   : {len(df_base):,}  (before per-horizon NaN drop)")
-    print(f"  RV summary   : mean={df_base['RV'].mean():.4f}  "
-          f"sd={df_base['RV'].std():.4f}  min={df_base['RV'].min():.4f}  "
-          f"max={df_base['RV'].max():.4f}")
-    print(f"  RV skew      : {df_base['RV'].skew():.2f}   "
-          f"excess kurt: {df_base['RV'].kurt():.2f}")
+    print(f"  RV summary   : mean={df_base['RV_raw'].mean():.4f}  "
+          f"sd={df_base['RV_raw'].std():.4f}  min={df_base['RV_raw'].min():.4f}  "
+          f"max={df_base['RV_raw'].max():.4f}")
+    print(f"  RV skew      : {df_base['RV_raw'].skew():.2f}   "
+          f"excess kurt: {df_base['RV_raw'].kurt():.2f}")
+    if LOG_MODE:
+        # The reason to log: raw RV is violently right-skewed and fat-tailed,
+        # ln(RV) is close to Gaussian. These two lines quantify the change on
+        # the sample actually being used.
+        print(f"  ln(RV) summ. : mean={df_base['RV'].mean():.4f}  "
+              f"sd={df_base['RV'].std():.4f}  min={df_base['RV'].min():.4f}  "
+              f"max={df_base['RV'].max():.4f}")
+        print(f"  ln(RV) skew  : {df_base['RV'].skew():.2f}   "
+              f"excess kurt: {df_base['RV'].kurt():.2f}   "
+              f"<- modelling series")
     print(f"  Split: Train {SAMPLE_START_YEAR}-{TRAIN_END_YEAR}  |  "
           f"Test {TEST_START_YEAR}-{SAMPLE_END_YEAR}")
 
+    # Floor is a raw-variance quantity, so it always comes from RV_raw.
     floor = QLIKE_FLOOR_FRAC * float(
-        df_base.loc[df_base.index.year <= TRAIN_END_YEAR, "RV"].mean())
-    print(f"  QLIKE floor for non-positive forecasts: {floor:.3e}")
+        df_base.loc[df_base.index.year <= TRAIN_END_YEAR, "RV_raw"].mean())
+    print(f"  QLIKE floor for non-positive forecasts: {floor:.3e}"
+          + ("  (cannot bind under --log)" if LOG_MODE else ""))
 
     # -- 10.2  Per-horizon loop ------------------------------------------------
     results_dict, all_metrics = {}, {}
@@ -967,18 +1318,34 @@ def main(argv=None):
         y_hat_train = result.predict(X_tr)
         y_hat_test  = result.predict(X_te)
 
-        m_train = compute_metrics(train["Y_h"].values, y_hat_train.values, floor)
-        m_test  = compute_metrics(test["Y_h"].values,  y_hat_test.values,  floor)
+        # Jensen correction term for --log. Estimated on TRAINING residuals
+        # only -- using test residuals would leak the out-of-sample outcome
+        # into the forecast. Zero in raw mode, where nothing is exponentiated.
+        resid_var = float(result.mse_resid) if LOG_MODE else 0.0
 
-        if m_test["n_neg_pred"]:
+        m_train = compute_metrics(train["Y_h"].values, y_hat_train.values,
+                                  floor, resid_var)
+        m_test  = compute_metrics(test["Y_h"].values,  y_hat_test.values,
+                                  floor, resid_var)
+
+        if LOG_MODE:
+            print(f"\n  Back-transform: sigma^2 = {resid_var:.4f}  ->  "
+                  f"exp(sigma^2/2) = {np.exp(resid_var / 2.0):.4f}x")
+            print(f"    Test QLIKE  {m_test['QLIKE']:.6f} (corrected)  vs  "
+                  f"{m_test['QLIKE_naive']:.6f} (naive exp)")
+            print(f"    Naive exp() would forecast the conditional MEDIAN and "
+                  f"sit ~{100.0 * (np.exp(resid_var / 2.0) - 1.0):.1f}% low "
+                  f"as a mean.")
+        elif m_test["n_neg_pred"]:
             print(f"\n  ! {m_test['n_neg_pred']} non-positive test forecast(s) "
                   f"({m_test['pct_neg']:.1f}%) -- floored for QLIKE. "
-                  f"Expected in levels; a log-scale HAR cannot produce these.")
+                  f"Expected in levels; --log cannot produce these.")
 
         print_diagnostics(residual_diagnostics(result), h)
 
         results_dict[h] = {"result": result, "df_train": train, "df_test": test,
-                           "y_hat_train": y_hat_train, "y_hat_test": y_hat_test}
+                           "y_hat_train": y_hat_train, "y_hat_test": y_hat_test,
+                           "resid_var": resid_var}
         all_metrics[h]  = {"train": m_train, "test": m_test}
 
     # -- 10.3  Cross-horizon comparison table ----------------------------------
@@ -999,9 +1366,11 @@ def main(argv=None):
     # -- 10.6  Summary ---------------------------------------------------------
     print(f"\n{SEP}")
     print(f"  FINAL SUMMARY -- OUT-OF-SAMPLE TEST SET  "
-          f"({TEST_START_YEAR}-{SAMPLE_END_YEAR})  [RAW RV SCALE]")
+          f"({TEST_START_YEAR}-{SAMPLE_END_YEAR})  [{scale_banner()}]")
     print(THIN)
-    print(f"  {'Horizon':<14} {'NW Lag':>8} {'MSE':>12} {'MAE':>12} "
+    mse_hdr = "MSE[ln]" if LOG_MODE else "MSE"
+    mae_hdr = "MAE[ln]" if LOG_MODE else "MAE"
+    print(f"  {'Horizon':<14} {'NW Lag':>8} {mse_hdr:>12} {mae_hdr:>12} "
           f"{'QLIKE':>12} {'neg pred':>10}")
     print(THIN)
     for h in HORIZONS:
@@ -1010,7 +1379,44 @@ def main(argv=None):
               f"{m['MSE']:>12.6f} {m['MAE']:>12.6f} {m['QLIKE']:>12.6f} "
               f"{m['n_neg_pred']:>10}")
     print(THIN)
-    print(f"""
+    if LOG_MODE:
+        print(f"  Back-transformed to the variance scale (for comparison with a")
+        print(f"  raw-scale run -- exact at h=1, geometric-vs-arithmetic at h>1):")
+        print(f"  {'Horizon':<14} {'':>8} {'MSE_RV':>12} {'MAE_RV':>12}")
+        for h in HORIZONS:
+            m = all_metrics[h]["test"]
+            print(f"  {HORIZONS[h]['label']:<14} {'':>8}  "
+                  f"{m['MSE_RV']:>12.6f} {m['MAE_RV']:>12.6f}")
+        print(THIN)
+    if LOG_MODE:
+        print(f"""
+  Aggregation (--log: logs taken FIRST, then averaged -- means of logs):
+    Target     Y^(h) = (1/h) * Sum_k ln RV_(t+k)  over the h-day forward window
+    Regressors RV_d  = ln RV_(t-1)
+               RV_w  = mean of ln RV over the previous 5 days
+               RV_m  = mean of ln RV over the previous 22 days
+
+  Reading the output:
+    * MSE/MAE are in ln(RV) units and are NOT comparable to raw-scale losses.
+      Re-evaluate any DL baseline on the same scale, or use MSE_RV/MAE_RV.
+    * QLIKE is a variance loss, so it is computed after exp() with the
+      lognormal Jensen correction exp(sigma^2/2); sigma^2 is the TRAINING
+      residual variance. Plain exp() targets the median and runs low.
+    * Non-positive forecasts are impossible here: exp(.) > 0 always. The
+      QLIKE floor is inert, and 'neg pred' is 0 by construction.
+    * Squared error in logs is a relative-error criterion, so single spike
+      days no longer dominate the loss the way they do in levels.
+    * Breusch-Pagan should be far smaller than in the levels fit -- that is
+      the transform working. HAC is still used for the serial correlation,
+      which logging does not remove.
+    * At h=1 the log and raw targets are the same object, so back-transformed
+      losses are directly comparable to a raw run. At h>1 they are not: the
+      log target is a geometric forward mean, the raw target an arithmetic
+      one, and geometric <= arithmetic by Jensen.
+
+  Split:""")
+    else:
+        print(f"""
   Aggregation (raw scale, no logs anywhere):
     Target     Y^(h) = (1/h) * Sum_k RV_(t+k)   over the h-day forward window
     Regressors RV_d  = RV_(t-1)
@@ -1019,13 +1425,14 @@ def main(argv=None):
 
   Reading the output:
     * Losses are on the RV scale and are NOT comparable to the ln(RV)-scale
-      losses from the log version. Re-evaluate any DL baseline on this scale.
+      losses produced by --log. Re-evaluate any DL baseline on this scale.
     * MSE is spike-dominated in levels; prefer MAE and QLIKE for ranking.
     * Non-positive forecasts are possible and are reported per horizon.
     * Breusch-Pagan will reject strongly -- expected, not a bug. HAC SEs
       remain valid; OLS is simply no longer efficient.
 
-  Split:
+  Split:""")
+    print(f"""\
     Train  {SAMPLE_START_YEAR} - {TRAIN_END_YEAR}  (year <= {TRAIN_END_YEAR})
     Test   {TEST_START_YEAR} - {SAMPLE_END_YEAR}   (year >= {TEST_START_YEAR})
     Dataset_Custom (data_loader.py) splits train / val / test at the same
@@ -1046,6 +1453,13 @@ def main(argv=None):
       matrix estimation. Review of Economic Studies, 61(4), 631-653.
     Bollerslev, T., Patton, A. J., & Quaedvlieg, R. (2016). Exploiting
       the errors. Journal of Econometrics, 192(1), 1-18.
+    Andersen, T. G., Bollerslev, T., Diebold, F. X., & Labys, P. (2003).
+      Modeling and forecasting realized volatility. Econometrica, 71(2),
+      579-625.  [log-scale RV modelling; lognormal back-transform]
+    Andersen, T. G., Bollerslev, T., & Diebold, F. X. (2007). Roughing it up:
+      including jump components in the measurement, modeling, and forecasting
+      of return volatility. Review of Economics and Statistics, 89(4),
+      701-720.  [log-HAR specification used by --log]
 """)
     print(SEP)
 
