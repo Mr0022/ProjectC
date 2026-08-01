@@ -1,0 +1,537 @@
+% =============================================================================
+%  Forecast targets and loss functions:
+%  deep time-series models vs. the multi-horizon HAR-RV arrangement
+%
+%  Compiles standalone:      pdflatex dl_vs_har_targets_losses.tex
+%  Or drop into a thesis:    copy everything between the two
+%                            "%%% BODY BEGIN/END" markers into a chapter and
+%                            move the \newcommand block to your preamble.
+%
+%  Companion notes:  docs/HAR-RV-methodology.md   (the HAR specification)
+%                    docs/har_rv_methodology.tex
+%  Verification:     docs/verify_target_alignment.py   (3/3 checks pass)
+%  Code compared:    HAR-RV_RUN.PY
+%                    exp/exp_long_term_forecasting.py
+%                    data_provider/data_loader.py, utils/metrics.py, run.py
+% =============================================================================
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{bm}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage[hidelinks]{hyperref}
+
+\newcommand{\RV}{\mathrm{RV}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\operatorname{Var}}
+\newcommand{\Fset}{\mathcal{F}}
+\newcommand{\MSE}{\mathrm{MSE}}
+\newcommand{\MAE}{\mathrm{MAE}}
+\newcommand{\QLIKE}{\mathrm{QLIKE}}
+\newcommand{\Lpath}{\mathcal{L}_{\mathrm{path}}}
+\newcommand{\Lagg}{\mathcal{L}_{\mathrm{agg}}}
+\newcommand{\Lin}{L_{\mathrm{in}}}
+\newcommand{\Llab}{L_{\mathrm{lab}}}
+\newcommand{\Lout}{L_{\mathrm{out}}}
+
+\newtheorem{proposition}{Proposition}
+\newtheorem{remark}{Remark}
+
+\title{Forecast Targets and Loss Functions:\\
+Deep Time-Series Models versus the Multi-Horizon HAR-RV Arrangement}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+A deep forecasting model in the Time-Series-Library convention and the HAR-RV model of
+Corsi (2009) do not, by default, predict the same object or minimise the same criterion.
+The former predicts a \emph{path} of $\Lout$ daily values and minimises the mean squared
+error averaged over that path; the latter predicts a \emph{scalar}, the $h$-day forward
+average of realized variance, and minimises the squared error of that single quantity.
+This note states both objects formally, proves the exact relationship between the two
+losses --- path loss equals the HAR criterion plus a within-window dispersion term
+(Proposition~\ref{prop:decomp}) --- documents the modifications that place the deep models
+on the HAR target, and lists what remains non-comparable. All quantitative claims are
+verified numerically in \texttt{docs/verify\_target\_alignment.py}.
+\end{abstract}
+
+%%% BODY BEGIN %%%
+
+\section{Notation and the common sample}
+\label{sec:setup}
+
+Let $t=1,\dots,T$ index trading days, $\RV_t>0$ be daily realized variance and $\Fset_t$ the
+information set at the close of day $t$. Both model families are estimated on the same
+series after the same filtering rule (non-positive $\RV$ rows, i.e.\ non-trading days, are
+dropped), and the chronological splits are
+\begin{equation}
+  \underbrace{\text{train} \le 2022}_{\text{deep: gradient updates}}
+  \;\;\Big|\;\;
+  \underbrace{2023\text{--}2024}_{\text{deep: early stopping}}
+  \;\;\Big|\;\;
+  \underbrace{\text{test} \ge 2025}_{\text{both: scored}},
+  \qquad
+  \underbrace{\text{train} \le 2024}_{\text{HAR: OLS}}
+  \;\;\Big|\;\;
+  \underbrace{\text{test} \ge 2025}_{\text{both: scored}} .
+  \label{eq:splits}
+\end{equation}
+The HAR has no hyperparameters, so its estimation sample absorbs the validation years; the
+\emph{test} window is identical for both, which is what makes the comparison legitimate.
+Section~\ref{sec:caveats} returns to the fact that the two estimation samples are
+nonetheless not the same.
+
+Deep models are windowed by the triple $(\Lin,\Llab,\Lout)$: look-back (\texttt{seq\_len}),
+decoder start-token length (\texttt{label\_len}) and forecast length (\texttt{pred\_len}).
+Throughout we set $\Lout=h$ and consider the univariate case
+(\texttt{features='S'}, one channel), which is the configuration used for realized variance.
+
+\section{The default deep-learning arrangement}
+\label{sec:dl-default}
+
+\subsection{Target: a path}
+
+For a forecast origin $t$ the network maps the look-back window to the \emph{whole future
+path},
+\begin{equation}
+  \hat{\bm{y}}_{t} \;=\; g_\theta\bigl(\RV_{t-\Lin+1},\dots,\RV_{t}\bigr)
+  \;\in\; \mathbb{R}^{\Lout},
+  \qquad
+  \bm{y}_{t} \;=\; \bigl(\RV_{t+1},\dots,\RV_{t+\Lout}\bigr)' .
+  \label{eq:dl-target}
+\end{equation}
+The dependent variable is therefore $\Lout$-dimensional: the model is asked \emph{when},
+not only \emph{how much}. The decoder start token consists of the last $\Llab$ observations
+of the input window, all dated $\le t$, so \eqref{eq:dl-target} involves no look-ahead
+despite appearances.\footnote{In the loader, $\texttt{batch\_y[:, :}\Llab\texttt{]}$ indexes
+rows $[t-\Llab+1,\,t]$, which lie inside the encoder window; only the trailing $\Lout$
+positions of the decoder input are zero-filled.}
+
+\subsection{Loss: mean squared error averaged over the path}
+
+Training minimises \texttt{nn.MSELoss()} over a minibatch $\mathcal{B}$,
+\begin{equation}
+  \Lpath(\theta)
+  \;=\;
+  \frac{1}{|\mathcal{B}|\,\Lout}
+  \sum_{t\in\mathcal{B}}\;\sum_{k=1}^{\Lout}
+  \bigl(\RV_{t+k}-\hat{y}_{t,k}\bigr)^{2},
+  \label{eq:dl-loss}
+\end{equation}
+i.e.\ the squared error is averaged \emph{across horizon steps as well as across windows}.
+Every step $k=1,\dots,\Lout$ carries equal weight, so a one-day-ahead error and a
+twenty-two-day-ahead error contribute equally. Early stopping monitors the same functional
+on the validation split.
+
+\subsection{Reported metrics}
+
+The harness reports $\MAE$, $\MSE$, $\mathrm{RMSE}$, $\mathrm{MAPE}$ and $\mathrm{MSPE}$
+computed over the flattened $(n\times\Lout)$ tensor of path forecasts. Two of these deserve
+a warning in any volatility application: $\mathrm{MAPE}$ and $\mathrm{MSPE}$ divide by
+$\RV_t$ and therefore explode on quiet days, and $\MAE$ elicits the conditional
+\emph{median} and is not robust to noise in the volatility proxy
+(Section~\ref{sec:consistency}). Neither should drive model selection.
+
+\subsection{Scaling}
+
+The stock Time-Series-Library loader standardises each channel with statistics fitted on
+the training split, $z=(y-\hat\mu_{\text{train}})/\hat\sigma_{\text{train}}$, and trains on
+$z$. In this repository \texttt{Dataset\_Custom} is instantiated with \texttt{scale=False}
+and \texttt{data\_factory} never overrides it, so \textbf{no standardisation is applied}:
+the network consumes $\RV$ (or $\ln \RV$ under \texttt{-{}-log}) directly and
+\eqref{eq:dl-loss} is expressed in variance units. Two consequences follow.
+\begin{enumerate}
+  \item The deep training loss and the HAR training loss are in the same units and are
+        numerically comparable --- the reason for the choice.
+  \item Raw $\RV$ is strongly right-skewed and badly conditioned as a network input. Under
+        \texttt{-{}-log} the logarithm plays the variance-stabilising role that $z$-scoring
+        would otherwise play; in raw mode nothing does, so raw-mode deep runs should be
+        expected to optimise less comfortably than log-mode runs. This is a property of the
+        experiment, not a defect, but it must be reported.
+\end{enumerate}
+
+\section{The HAR-RV target for comparison}
+\label{sec:har}
+
+The HAR predicts the scalar $h$-day forward \emph{average} realized variance
+\begin{equation}
+  Y^{(h)}_{t} \;=\; \frac{1}{h}\sum_{k=1}^{h}\RV_{t+k}
+  \qquad\text{(raw)},
+  \qquad
+  y^{(h)}_{t} \;=\; \ln Y^{(h)}_{t}
+  \qquad\text{(log-of-mean)},
+  \label{eq:har-target}
+\end{equation}
+by ordinary least squares on the three heterogeneous components, so its in-sample criterion
+is the squared error of a \emph{single} number per origin. Full specification: see the
+companion note \texttt{docs/HAR-RV-methodology.md}. The essential point here is that
+\eqref{eq:dl-target} and \eqref{eq:har-target} are different objects whenever $h>1$:
+one is a vector in $\mathbb{R}^{h}$, the other its arithmetic mean.
+
+\section{The modifications: \texttt{-{}-aggregate\_mean} and \texttt{-{}-log}}
+\label{sec:modifications}
+
+Six changes place the deep models on the HAR target. Each is stated with the mathematics it
+implements.
+
+\paragraph{(i) Scalar output head.} The model is constructed with
+$\texttt{pred\_len}=1$, so the head emits $\hat{Y}^{(h)}_{t}\in\mathbb{R}$ rather than a
+path, while the loader still returns the full $h$-day future window needed to build the
+ground truth. The forecast is a direct projection onto the aggregate, not a post-hoc
+average of a path forecast.
+
+\paragraph{(ii) Target aggregation in variance space.} The future window is reduced to
+\eqref{eq:har-target}. Aggregation always happens on the variance scale --- the additive
+scale, where averaging variances is the meaningful operation --- and the logarithm, when
+present, is applied to the aggregate:
+\begin{equation}
+  Y^{(h)}_{t}=\frac{1}{h}\sum_{k=1}^{h}\RV_{t+k},
+  \qquad
+  y^{(h)}_{t}=\ln\Bigl(\frac{1}{h}\sum_{k=1}^{h}\RV_{t+k}\Bigr)
+  \;\ne\;
+  \frac{1}{h}\sum_{k=1}^{h}\ln \RV_{t+k}.
+  \label{eq:logofmean}
+\end{equation}
+The right-hand inequality is Jensen's: the mean of logs is the log of the \emph{geometric}
+mean, a smaller and mechanically smoother object. Only log-of-mean gives
+$\exp\bigl(y^{(h)}_{t}\bigr)=Y^{(h)}_{t}$ exactly at every horizon, which is what allows a
+log-scale run to be scored against a raw-scale run and against the HAR.
+
+\paragraph{(iii) Numerically stable log target.} Under \texttt{-{}-log} the stored series is
+already $x_s=\ln \RV_s$, so the target is formed without ever exponentiating a large
+magnitude:
+\begin{equation}
+  y^{(h)}_{t}
+  \;=\;\ln\Bigl(\frac{1}{h}\sum_{k=1}^{h}e^{x_{t+k}}\Bigr)
+  \;=\;\operatorname*{logsumexp}_{k=1,\dots,h}\bigl(x_{t+k}\bigr)-\ln h ,
+  \label{eq:logsumexp}
+\end{equation}
+an algebraic identity, verified to $8.9\times10^{-16}$ on the sample.
+
+\paragraph{(iv) Aggregate loss.} The training criterion becomes
+\begin{equation}
+  \Lagg(\theta)
+  \;=\;
+  \frac{1}{|\mathcal{B}|}\sum_{t\in\mathcal{B}}
+  \bigl(Y^{(h)}_{t}-\hat{Y}^{(h)}_{t}\bigr)^{2}
+  \qquad\text{(raw)},
+  \qquad
+  \frac{1}{|\mathcal{B}|}\sum_{t\in\mathcal{B}}
+  \bigl(y^{(h)}_{t}-\hat{y}^{(h)}_{t}\bigr)^{2}
+  \qquad\text{(log)},
+  \label{eq:agg-loss}
+\end{equation}
+which is precisely the criterion OLS minimises in the HAR regression. The two model
+families now optimise the same functional of the same target, differing only in the
+hypothesis class.
+
+\paragraph{(v) No inverse transform in aggregate mode.} With standardisation off there is
+nothing to invert; and even were it on, the aggregated target does not live in the
+scaler's space, since $\mathcal{S}^{-1}$ applied to an average of standardised variances is
+not the average of the inverse-transformed variances unless $\mathcal{S}$ is affine and
+applied before aggregation. Aggregate-mode outputs are therefore left on the modelling
+scale and scored there.
+
+\paragraph{(vi) Evaluation on the HAR footing.} Beyond the harness metrics, aggregate-mode
+runs report the HAR loss set: $\MSE$, $\MAE$ and $\QLIKE$ (Patton, 2011),
+\begin{equation}
+  \QLIKE=\frac{1}{n}\sum_{t}\left[\frac{Y^{(h)}_{t}}{\hat{Y}^{(h)}_{t}}
+  -\ln\!\left(\frac{Y^{(h)}_{t}}{\hat{Y}^{(h)}_{t}}\right)-1\right]\;\ge\;0,
+  \label{eq:qlike}
+\end{equation}
+with non-positive forecasts floored at $10^{-4}\,\overline{\RV}_{\text{train}}$ and the
+count reported rather than discarded --- the identical rule to the HAR script, so the floor
+cannot silently advantage either model. Under \texttt{-{}-log} both sides are mapped back to
+variances first (Section~\ref{sec:backtransform}).
+
+\paragraph{Sample hygiene.} \texttt{-{}-aggregate\_mean} and \texttt{-{}-log} both force
+\texttt{drop\_nonpositive}, so the deep models train on exactly the rows the HAR keeps; and
+the test loader sets \texttt{drop\_last=False}, so the trailing partial batch is retained.
+Dropping it would discard up to $|\mathcal{B}|-1$ test targets and break the row-for-row
+correspondence established in Proposition~\ref{prop:align}.
+
+\section{The exact relationship between the two losses}
+\label{sec:decomposition}
+
+\begin{proposition}[Path loss $=$ aggregate loss $+$ within-window dispersion]
+\label{prop:decomp}
+Fix an origin $t$ and a horizon $h$. Let $e_k=\RV_{t+k}-\hat{y}_{t,k}$ be the daily forecast
+errors of a path forecast, $k=1,\dots,h$, and let
+$\bar{e}=h^{-1}\sum_{k=1}^{h}e_k$. Then
+\begin{equation}
+  \underbrace{\frac{1}{h}\sum_{k=1}^{h}e_k^{2}}_{\text{path loss at }t}
+  \;=\;
+  \underbrace{\bar{e}^{\,2}}_{\text{aggregate (HAR) loss at }t}
+  \;+\;
+  \underbrace{\frac{1}{h}\sum_{k=1}^{h}\bigl(e_k-\bar{e}\bigr)^{2}}_{\text{within-window dispersion}\;\ge\,0},
+  \qquad
+  \bar{e}=Y^{(h)}_{t}-\frac{1}{h}\sum_{k=1}^{h}\hat{y}_{t,k}.
+  \label{eq:decomp}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+The first equality is the algebraic identity
+$h^{-1}\sum_k e_k^2 = \bar{e}^{\,2}+h^{-1}\sum_k(e_k-\bar{e})^2$, valid for any finite
+sequence. The expression for $\bar{e}$ follows from linearity of the average and the
+definition \eqref{eq:har-target} of $Y^{(h)}_{t}$.
+\end{proof}
+
+Three consequences, each of which should be stated when the two model families are compared.
+
+\begin{enumerate}
+  \item \textbf{The default deep loss is not the HAR criterion; it is the HAR criterion plus
+        a penalty.} Since the dispersion term is non-negative,
+        $\Lpath\ge\Lagg$ always, with equality only when the error is constant across the
+        window. A model trained under \eqref{eq:dl-loss} spends capacity on getting the
+        \emph{timing} of volatility within the window right --- something the HAR is never
+        asked to do and is never scored on.
+  \item \textbf{The penalty dominates in practice.} On the shipped EUR/USD sample, using a
+        plausible random-walk-with-noise path forecaster, the median ratio
+        $\Lpath/\Lagg$ is $2.8$ at $h=5$ and $4.4$ at $h=22$, so the dispersion term
+        accounts for a median $65\%$ of the path loss at $h=5$ and $77\%$ at $h=22$. Two
+        thirds to three quarters of the default deep training signal is within-window
+        \emph{shape}, not the level of the $h$-day average, and the share grows with the
+        horizon. Comparing such a model's loss with the HAR's is comparing two different
+        quantities.
+  \item \textbf{Aggregating after the fact is not the same as training on the aggregate.}
+        Averaging a trained path forecast gives a valid $\hat{Y}^{(h)}$, but the parameters
+        were selected to minimise $\Lagg + \text{dispersion}$, not $\Lagg$. Modification (i)
+        removes the second term from the objective rather than from the report.
+\end{enumerate}
+
+\section{Which loss elicits which functional}
+\label{sec:consistency}
+
+A loss $L$ is \emph{consistent} for a functional $\Gamma$ if
+$\Gamma(\Fset_t)=\arg\min_{f}\E[L(Y,f)\mid\Fset_t]$. This determines what a trained model
+converges to and is the criterion by which a training loss and an evaluation loss can be
+said to agree.
+
+\begin{center}
+\begin{tabular}{@{}llp{5.6cm}@{}}
+\toprule
+Loss & Elicits & Comment \\
+\midrule
+Path $\MSE$ \eqref{eq:dl-loss}      & $\E[\RV_{t+k}\mid\Fset_t]$, each $k$ & the whole conditional mean path \\
+Aggregate $\MSE$ \eqref{eq:agg-loss}, raw & $\E[Y^{(h)}_{t}\mid\Fset_t]$   & the HAR estimand \\
+Aggregate $\MSE$, log scale         & $\E[\ln Y^{(h)}_{t}\mid\Fset_t]$     & \emph{not} $\E[Y^{(h)}_t\mid\Fset_t]$; needs \S\ref{sec:backtransform} \\
+$\QLIKE$ \eqref{eq:qlike}           & $\E[Y^{(h)}_{t}\mid\Fset_t]$         & same functional as raw $\MSE$ \\
+$\MAE$                              & conditional median                   & different functional; not proxy-robust \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Two readings follow. First, \emph{training on $\MSE$ and evaluating on $\QLIKE$ is
+coherent}: both belong to Patton's (2011) robust family, both are minimised by the
+conditional mean of the variance proxy, and they differ only in how they weight errors
+across the volatility range --- $\QLIKE$ penalising under-prediction far more heavily.
+Neither model optimises $\QLIKE$ directly, which is worth stating, but the ranking it
+produces is not out-of-objective in the way an $\MAE$ ranking would be. Second, $\MAE$ and
+$\mathrm{MAPE}$ elicit different functionals and are not robust to the noise in $\RV$ as a
+proxy for latent variance; report them descriptively, select on $\MSE$ and $\QLIKE$.
+
+\section{Back-transformation under \texttt{-{}-log}}
+\label{sec:backtransform}
+
+Log-scale training elicits $\E[\ln Y^{(h)}\mid\Fset_t]$, so $\exp(\hat{y}^{(h)})$ is a
+conditional \emph{median} and understates the conditional mean. Both model families apply
+the lognormal correction, but the deep version carries one extra term:
+\begin{equation}
+  \hat{Y}^{(h)}_{t}
+  \;=\;
+  \exp\!\Bigl(\hat{y}^{(h)}_{t} \;+\; \underbrace{b}_{\text{mean residual}} \;+\; \tfrac{1}{2}\hat\sigma_u^{2}\Bigr),
+  \qquad
+  b=\frac{1}{n_{\text{tr}}}\sum_{t\in\text{train}}\hat{u}_t,
+  \qquad
+  \hat\sigma_u^{2}=\widehat{\Var}_{\text{train}}(\hat{u}_t).
+  \label{eq:backtransform}
+\end{equation}
+For OLS with an intercept the mean residual is \emph{exactly} zero, so $b=0$ and
+\eqref{eq:backtransform} reduces to the HAR correction $\exp(\hat y+\hat\sigma_u^2/2)$; a
+network has no such guarantee, and omitting $b$ would leave a systematic level error in the
+back-transformed forecast. Setting $b=\hat\sigma_u^2=0$ recovers the naive transform, which
+is reported alongside so the size of the correction stays visible.
+
+Both moments are computed on \textbf{training} residuals only. Using test residuals would
+leak the realised outcome into the forecast. The result is strictly positive, so a
+log-scale model cannot produce the non-positive variance forecasts an unconstrained
+raw-scale head can.
+
+\section{Test-sample alignment}
+\label{sec:alignment}
+
+\begin{proposition}[The two families score the same forecast origins]
+\label{prop:align}
+Let $N$ be the number of retained rows and $V=\#\{s:\mathrm{year}(s)\le 2024\}$. With
+$\Lout=h$, the deep loader yields
+\begin{equation}
+  n_{\text{DL}} \;=\; \bigl(N-(V-\Lin)\bigr)-\Lin-h+1 \;=\; N-V-h+1
+  \label{eq:dl-count}
+\end{equation}
+test windows, whose targets span days $[V+i,\,V+i+h)$ for $i=0,\dots,n_{\text{DL}}-1$;
+the HAR retains rows $t\in[V,\,N-h]$, i.e.\ $n_{\text{HAR}}=N-V-h+1$ targets spanning
+$[t,\,t+h)$. The two sets of forecast origins, and hence the two sets of scored dates,
+coincide exactly, independently of $\Lin$.
+\end{proposition}
+
+The cancellation of $\Lin$ in \eqref{eq:dl-count} is not accidental: the validation and test
+windows begin $\Lin$ rows early precisely so that the first origin in each split has a
+complete look-back window without consuming a target. Numerically, on the shipped sample
+($T=3766$, $\Lin=96$):
+
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+$h$ & $n_{\text{DL}}$ & $n_{\text{HAR}}$ & scored window \\
+\midrule
+$1$  & $402$ & $402$ & 2025-01-02 -- 2026-07-21 \\
+$5$  & $398$ & $398$ & 2025-01-02 -- 2026-07-15 \\
+$22$ & $381$ & $381$ & 2025-01-02 -- 2026-06-22 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Losses are therefore averages over identical index sets and can be placed in the same table
+without reweighting. Note that the test targets overlap for $h>1$, so any formal comparison
+--- a Diebold--Mariano test on the loss differential, say --- must use a HAC variance with
+bandwidth at least $h-1$; the conventional choice, and the one the HAR script uses, is
+$\max\{2(h-1),\lfloor 4(n/100)^{2/9}\rfloor\}$.
+
+\section{Side-by-side summary}
+\label{sec:summary}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{3.1cm}p{3.9cm}p{3.9cm}p{3.4cm}@{}}
+\toprule
+ & \textbf{Deep, default} & \textbf{Deep, \texttt{-{}-aggregate\_mean}} & \textbf{HAR-RV} \\
+\midrule
+Target
+ & path $(\RV_{t+1},\dots,\RV_{t+h})'$
+ & scalar $Y^{(h)}_t=h^{-1}\sum_k \RV_{t+k}$
+ & scalar $Y^{(h)}_t$ \\[2pt]
+Output dimension
+ & $h$
+ & $1$
+ & $1$ \\[2pt]
+Training loss
+ & $\Lpath$, eq.\ \eqref{eq:dl-loss}
+ & $\Lagg$, eq.\ \eqref{eq:agg-loss}
+ & $\Lagg$ (OLS) \\[2pt]
+Elicits
+ & conditional mean path
+ & $\E[Y^{(h)}_t\mid\Fset_t]$
+ & $\E[Y^{(h)}_t\mid\Fset_t]$ \\[2pt]
+Conditioning set
+ & $\Lin$ lags ($96$)
+ & $\Lin$ lags ($96$)
+ & $22$ lags, 3 aggregates \\[2pt]
+Parameters
+ & $10^{4}$--$10^{6}$
+ & $10^{4}$--$10^{6}$
+ & $4$ \\[2pt]
+Log mode
+ & $\ln \RV$ per day
+ & $\ln$ of the mean, eq.\ \eqref{eq:logsumexp}
+ & $\ln$ of the mean \\[2pt]
+Standardisation
+ & off (\texttt{scale=False})
+ & off
+ & none \\[2pt]
+Back-transform
+ & ---
+ & $\exp(\hat y+b+\hat\sigma_u^2/2)$
+ & $\exp(\hat y+\hat\sigma_u^2/2)$, $b\equiv0$ \\[2pt]
+Reported metrics
+ & MAE, MSE, RMSE, MAPE, MSPE
+ & $+$ QLIKE, MSE\_RV, MAE\_RV, naive QLIKE
+ & MSE, MAE, QLIKE $(+$ RV-scale$)$ \\[2pt]
+Estimation sample
+ & $\le 2022$ $(+$ val for stopping$)$
+ & $\le 2022$ $(+$ val for stopping$)$
+ & $\le 2024$ \\[2pt]
+Inference
+ & none
+ & none
+ & Newey--West HAC \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{What remains non-comparable}
+\label{sec:caveats}
+
+Aligning the target and the loss removes the largest source of incomparability but not all
+of it. The following differences survive and belong in the limitations paragraph.
+
+\begin{enumerate}
+  \item \textbf{Conditioning sets differ.} The HAR conditions on $22$ lags compressed into
+        three averages; the deep models condition on $\Lin=96$ raw lags. The deep models
+        therefore see more history \emph{and} a richer representation of it. For a strict
+        like-for-like test, run the deep models with $\Lin=22$; otherwise report the
+        asymmetry, since part of any deep-model advantage is simply a longer window.
+  \item \textbf{Estimation samples differ.} By \eqref{eq:splits} the HAR fits on data
+        through 2024 while the deep models take gradient steps only on data through 2022,
+        using 2023--2024 for early stopping. The HAR has roughly two additional years of
+        fitting data; the deep models use those years for model selection instead. This is
+        the standard arrangement --- OLS has nothing to tune --- but it is not an identical
+        information budget.
+  \item \textbf{Neither family optimises $\QLIKE$.} Both train on squared error and are
+        ranked partly on $\QLIKE$. Section~\ref{sec:consistency} argues this is coherent,
+        since both losses elicit the same functional, but a $\QLIKE$-trained variant is the
+        natural robustness check.
+  \item \textbf{Model selection is stochastic on one side only.} Deep results depend on the
+        seed, initialisation and early-stopping epoch; OLS is deterministic and has a closed
+        form. Report deep results over several seeds, with dispersion, not a single run.
+  \item \textbf{Uncertainty quantification.} The HAR delivers HAC standard errors and
+        testable coefficient restrictions; the deep models as configured deliver point
+        forecasts only.
+  \item \textbf{The Jensen correction is estimated per model.} Under \texttt{-{}-log} each
+        model carries its own $(b,\hat\sigma_u^2)$, so back-transformed comparisons include
+        a model-specific constant. Report the correction factor $\exp(b+\hat\sigma_u^2/2)$
+        alongside the losses, as the harness does.
+\end{enumerate}
+
+\section{Reporting recipe}
+\label{sec:recipe}
+
+For each horizon $h\in\{1,5,22\}$ and each scale (raw, log), run the deep models with
+$\Lout=h$ and \texttt{-{}-aggregate\_mean}, and the HAR at the same $h$; then report, on the
+identical test index set of Proposition~\ref{prop:align}:
+\begin{enumerate}
+  \item $\MSE$ and $\MAE$ on the modelling scale, with the scale named in the column header
+        (raw $\RV$ versus $\ln \RV$ units --- these are not interchangeable);
+  \item $\QLIKE$ on the variance scale, with the naive-transform value and the count of
+        floored forecasts in a footnote;
+  \item $\MSE_{\RV}$ and $\MAE_{\RV}$ after back-transformation, which are the only
+        cross-scale-comparable columns;
+  \item Diebold--Mariano statistics against the HAR benchmark with a HAC variance at
+        bandwidth $\ge h-1$, or a Model Confidence Set if more than two models compete;
+  \item for deep models, mean and standard deviation across seeds.
+\end{enumerate}
+State in the caption that the deep target is $Y^{(h)}_t$ rather than the daily path, and
+cite Proposition~\ref{prop:decomp} for why the distinction matters --- a reader who assumes
+the default path loss will otherwise misread every deep column in the table.
+
+%%% BODY END %%%
+
+\begin{thebibliography}{9}
+\bibitem{corsi2009} Corsi, F. (2009). A simple approximate long-memory model of realized volatility. \emph{Journal of Financial Econometrics}, 7(2), 174--196.
+\bibitem{dm1995} Diebold, F.~X., \& Mariano, R.~S. (1995). Comparing predictive accuracy. \emph{Journal of Business \& Economic Statistics}, 13(3), 253--263.
+\bibitem{gneiting2011} Gneiting, T. (2011). Making and evaluating point forecasts. \emph{Journal of the American Statistical Association}, 106(494), 746--762.
+\bibitem{hln2011} Hansen, P.~R., Lunde, A., \& Nason, J.~M. (2011). The model confidence set. \emph{Econometrica}, 79(2), 453--497.
+\bibitem{patton2011} Patton, A.~J. (2011). Volatility forecast comparison using imperfect volatility proxies. \emph{Journal of Econometrics}, 160(1), 246--256.
+\bibitem{ps2009} Patton, A.~J., \& Sheppard, K. (2009). Evaluating volatility and correlation forecasts. In T.~G. Andersen et al. (Eds.), \emph{Handbook of Financial Time Series} (pp.~801--838). Springer.
+\bibitem{abdl2003} Andersen, T.~G., Bollerslev, T., Diebold, F.~X., \& Labys, P. (2003). Modeling and forecasting realized volatility. \emph{Econometrica}, 71(2), 579--625.
+\bibitem{duan1983} Duan, N. (1983). Smearing estimate: A nonparametric retransformation method. \emph{Journal of the American Statistical Association}, 78(383), 605--610.
+\end{thebibliography}
+
+\end{document}
