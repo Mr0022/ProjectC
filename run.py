@@ -7,11 +7,8 @@ import random
 import numpy as np
 
 if __name__ == '__main__':
-    fix_seed = 2021
-    random.seed(fix_seed)
-    torch.manual_seed(fix_seed)
-    np.random.seed(fix_seed)
-
+    # Seeding moved below parse_args() so --fix_seed can set it. It still runs
+    # before any model is built, which is what matters for reproducibility.
     parser = argparse.ArgumentParser(description='TimesNet')
 
     # basic config
@@ -56,6 +53,22 @@ if __name__ == '__main__':
                         help='drop rows whose target is <= 0 (non-trading days in RV data). Implied '
                              'by --log. Keep it off for datasets where negative targets are '
                              'meaningful, e.g. ETT oil temperature.')
+
+    # per-date forecast export (Diebold-Mariano / Model Confidence Set inputs)
+    parser.add_argument('--forecast_dir', type=str, default='./forecasts',
+                        help='directory for the per-date test forecast CSV written under '
+                             '--aggregate_mean. One row per forecast, keyed by the date the '
+                             'forecast is FOR, which is what DM and MCS consume; aggregate '
+                             'metrics cannot be turned back into it.')
+    parser.add_argument('--run_tag', type=str, default='',
+                        help='filename stem for the forecast CSV. Empty = derive it as '
+                             '<model>_<scale>_h<HH>_s<seed>.')
+    parser.add_argument('--fix_seed', type=int, default=2021,
+                        help='master seed for random/numpy/torch. Distinct from --seed, '
+                             'which only drives the augmentation module. Vary this to '
+                             'measure how much of a model\'s edge is seed noise -- neither '
+                             'DM nor MCS sees that variation, since both treat the '
+                             'forecasts as fixed.')
 
     # inputation task
     parser.add_argument('--mask_rate', type=float, default=0.25, help='mask ratio')
@@ -203,6 +216,10 @@ if __name__ == '__main__':
     parser.add_argument('--pos', type=int, choices=[0, 1], default=1, help='Positional Embedding. Set pos to 0 or 1')
 
     args = parser.parse_args()
+
+    random.seed(args.fix_seed)
+    torch.manual_seed(args.fix_seed)
+    np.random.seed(args.fix_seed)
 
     # --aggregate_mean means "the target is an average of variances", which only
     # makes sense for a strictly positive series, and --log needs positivity for

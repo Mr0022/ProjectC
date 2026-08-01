@@ -2,6 +2,8 @@ from data_provider.data_factory import data_provider
 from exp.exp_basic import Exp_Basic
 from utils.tools import EarlyStopping, adjust_learning_rate, visual
 from utils.metrics import metric, QLIKE, lognormal_back_transform
+from utils.forecast_export import (build_forecast_frame, write_forecast_frame,
+                                   run_tag)
 import torch
 import torch.nn as nn
 from torch import optim
@@ -107,6 +109,79 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         self.model.train()
         return np.concatenate(preds), np.concatenate(trues)
 
+    def _qlike_floor(self):
+        """
+        Floor for non-positive variance forecasts: 1e-4 * mean training RV,
+        the rule HAR-RV_RUN.PY uses. Cached -- it rebuilds the training set.
+        """
+        if getattr(self, '_qlike_floor_cache', None) is None:
+            train_data, _ = self._get_data(flag='train')
+            train_series = np.asarray(train_data.data_x, dtype=float)
+            mean_train_rv = float(np.mean(
+                np.exp(train_series) if getattr(self.args, 'log', False)
+                else train_series))
+            self._qlike_floor_cache = 1e-4 * mean_train_rv
+        return self._qlike_floor_cache
+
+    def _log_correction(self):
+        """
+        (bias, resid_var) for the lognormal back-transform, measured on
+        TRAINING residuals only -- test residuals would leak the out-of-sample
+        outcome into the forecast. Returns (0.0, 0.0) in raw mode, where no
+        back-transform happens. Cached: it costs a full pass over the training
+        set, and both the metrics report and the forecast export need it, which
+        also guarantees the two agree.
+        """
+        if not getattr(self.args, 'log', False):
+            return 0.0, 0.0
+        if getattr(self, '_log_correction_cache', None) is None:
+            _, train_loader = self._get_data(flag='train')
+            tr_p, tr_t = self._forward_collect(train_loader)
+            resid = tr_t - tr_p
+            self._log_correction_cache = (float(resid.mean()),
+                                          float(resid.var(ddof=1)))
+        return self._log_correction_cache
+
+    def _export_forecasts(self, preds, trues, test_data, setting):
+        """
+        Write one row per test forecast, keyed by the date it is FOR.
+
+        This is the artifact Diebold-Mariano and MCS actually consume: both
+        need the per-observation loss series, which no aggregate in
+        result_long_term_forecast.txt can reconstruct. Because the rows carry
+        dates on HAR-RV_RUN.PY's convention, a deep model and the HAR baseline
+        join directly -- see utils/forecast_export.py.
+
+        Only meaningful under --aggregate_mean, where a run produces exactly
+        one number per forecast date (the horizon average Y^(h)); the caller
+        enforces that.
+        """
+        dates = test_data.forecast_dates()
+        preds = np.asarray(preds, dtype=float).reshape(-1)
+        trues = np.asarray(trues, dtype=float).reshape(-1)
+        if len(dates) != len(preds):
+            # Loud rather than silent: a mismatch here would misalign every
+            # downstream test by an unknown offset.
+            raise RuntimeError(
+                f"{len(dates)} forecast dates but {len(preds)} forecasts for "
+                f"{setting}. Test loader must run unshuffled with "
+                f"drop_last=False for the dates to line up.")
+
+        scale = 'log' if getattr(self.args, 'log', False) else 'raw'
+        seed = getattr(self.args, 'fix_seed', 2021)
+        bias, resid_var = self._log_correction()
+
+        frame = build_forecast_frame(
+            dates, preds, trues,
+            model=self.args.model, scale=scale, horizon=self.args.pred_len,
+            seed=seed, split='test', bias=bias, resid_var=resid_var)
+
+        out_dir = getattr(self.args, 'forecast_dir', './forecasts')
+        tag = getattr(self.args, 'run_tag', '') or run_tag(
+            self.args.model, scale, self.args.pred_len, seed)
+        path = write_forecast_frame(frame, out_dir, tag)
+        print(f"  -> Saved {len(frame)} per-date forecasts: {path}")
+
     def _report_rv_metrics(self, preds, trues, setting):
         """
         Report the test losses on the same footing as HAR-RV_RUN.PY, so this
@@ -134,11 +209,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         trues = np.asarray(trues, dtype=float).reshape(-1)
 
         # QLIKE floor: same rule as HAR-RV_RUN.PY, 1e-4 * mean training RV.
-        train_data, train_loader = self._get_data(flag='train')
-        train_series = np.asarray(train_data.data_x, dtype=float)
-        mean_train_rv = float(np.mean(np.exp(train_series) if log_mode
-                                      else train_series))
-        floor = 1e-4 * mean_train_rv
+        floor = self._qlike_floor()
 
         lines = []
         if not log_mode:
@@ -150,10 +221,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         else:
             # Correction terms from TRAINING residuals only -- using test
             # residuals would leak the out-of-sample outcome into the forecast.
-            tr_p, tr_t = self._forward_collect(train_loader)
-            resid = tr_t - tr_p
-            bias = float(resid.mean())
-            resid_var = float(resid.var(ddof=1))
+            bias, resid_var = self._log_correction()
 
             actual_rv = np.exp(trues)
             pred_rv = lognormal_back_transform(preds, resid_var, bias)
@@ -424,6 +492,10 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         # directly comparable.
         if getattr(self.args, 'aggregate_mean', False):
             self._report_rv_metrics(preds, trues, setting)
+            # Per-date forecasts for Diebold-Mariano / MCS. Written here rather
+            # than derived later from pred.npy because only this scope knows
+            # the dates and the training-residual correction.
+            self._export_forecasts(preds, trues, test_data, setting)
 
         np.save(folder_path + 'metrics.npy', np.array([mae, mse, rmse, mape, mspe]))
         np.save(folder_path + 'pred.npy', preds)

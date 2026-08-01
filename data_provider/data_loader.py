@@ -176,6 +176,30 @@ class Dataset_Custom(Dataset):
         self.data_x = data[border1:border2]
         self.data_y = data[border1:border2]
         self.data_stamp = data_stamp
+        # Calendar dates of this split's rows, aligned 1:1 with data_x. Kept so
+        # a forecast can be written out against the day it is FOR -- see
+        # forecast_dates() -- which is what lets the deep models be joined to
+        # HAR-RV_RUN.PY row for row.
+        self.date_index = df_raw['date'][border1:border2].reset_index(drop=True)
+
+    def forecast_dates(self):
+        """
+        The date each sample forecasts, one per __getitem__ index.
+
+        Sample i reads rows [i, i+seq_len) and predicts rows
+        [i+seq_len, i+seq_len+pred_len), so its information set ends the day
+        BEFORE row i+seq_len and its target window opens ON row i+seq_len.
+        Stamping the forecast with that opening day reproduces exactly the
+        convention of HAR-RV_RUN.PY's build_horizon_target, where Y_t^(h)
+        spans t .. t+h-1 off regressors shifted to t-1. The two models
+        therefore key on identical dates with no offset to reconcile.
+
+        Note this is independent of seq_len: a longer look-back moves the split
+        border back by the same amount (year_split_borders), so the first
+        forecast still lands on the first row of the split proper.
+        """
+        return self.date_index.iloc[self.seq_len:self.seq_len + len(self)] \
+                   .reset_index(drop=True)
 
     def __getitem__(self, index):
         s_begin = index
