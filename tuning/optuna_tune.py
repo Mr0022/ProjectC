@@ -315,7 +315,12 @@ def main():
                              'times faster if the ranking is only indicative')
     parser.add_argument('--seed', type=int, default=2021)
     parser.add_argument('--train_epochs', type=int, default=30)
-    parser.add_argument('--patience', type=int, default=5)
+    parser.add_argument('--patience', type=int, default=7,
+                        help='epochs without validation improvement before training stops. '
+                             '7 is deliberately patient: on this small, noisy split a '
+                             'configuration can sit flat for several epochs and then '
+                             'improve, and a short fuse would rank it on the plateau '
+                             'rather than on where it ends up')
     parser.add_argument('--n_startup_trials', type=int, default=10)
     parser.add_argument('--n_warmup_steps', type=int, default=5)
     parser.add_argument('--out_dir', default='./tuning/results')

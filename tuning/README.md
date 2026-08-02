@@ -24,7 +24,7 @@ the same command resumes rather than restarts.
 | `pred_len` | **1** | one-step-ahead |
 | `label_len` | 48 | decoder start token; none of the eleven has a real decoder, so it only sizes the unused `dec_inp` |
 | `features` / `enc_in` | `S` / 1 | univariate `RV` |
-| `train_epochs` / `patience` | 30 / 5 | early stopping, not epoch count, controls capacity |
+| `train_epochs` / `patience` | 30 / **7** | early stopping, not epoch count, controls capacity. Patience 7 lets a configuration sit flat for several epochs and still recover, which happens on a split this noisy |
 | repeats per trial | **3** (`--n_seeds`, alias `--itr`) | each configuration is trained 3× (seeds 2021–2023) and scored by the **mean** |
 | loss / selection | MSE on validation | test split is never read during a study |
 
