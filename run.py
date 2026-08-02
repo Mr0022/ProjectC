@@ -6,12 +6,24 @@ from utils.print_args import print_args
 import random
 import numpy as np
 
-if __name__ == '__main__':
-    fix_seed = 2021
-    random.seed(fix_seed)
-    torch.manual_seed(fix_seed)
-    np.random.seed(fix_seed)
 
+def set_seed(seed):
+    """Seed every RNG a run draws from: weight init, shuffling and dropout.
+
+    Called once per --itr iteration rather than once per process. Seeding only
+    at start-up would let the RNG stream carry over between iterations, so the
+    initialisation of run i would depend on how many epochs run i-1 trained for
+    before early stopping -- the repeats would then differ partly for reasons
+    that have nothing to do with initialisation, which is the spread an itr
+    sweep is meant to measure.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='TimesNet')
 
     # basic config
@@ -109,7 +121,13 @@ if __name__ == '__main__':
 
     # optimization
     parser.add_argument('--num_workers', type=int, default=10, help='data loader num workers')
-    parser.add_argument('--itr', type=int, default=1, help='experiments times')
+    # Repeats are seeded independently: run i uses --seed + i. That keeps every
+    # run reproducible on its own, so `--itr N --seed S` and N separate
+    # `--itr 1 --seed S+i` jobs (sharded across GPUs) produce the same results.
+    parser.add_argument('--itr', type=int, default=1,
+                        help='number of repeated runs; run i uses seed (--seed + i)')
+    parser.add_argument('--seed', type=int, default=2021,
+                        help='base random seed; run i of --itr uses (--seed + i)')
     parser.add_argument('--train_epochs', type=int, default=10, help='train epochs')
     parser.add_argument('--batch_size', type=int, default=32, help='batch size of train input data')
     parser.add_argument('--patience', type=int, default=3, help='early stopping patience')
@@ -138,7 +156,6 @@ if __name__ == '__main__':
 
     # Augmentation
     parser.add_argument('--augmentation_ratio', type=int, default=0, help="How many times to augment")
-    parser.add_argument('--seed', type=int, default=2, help="Randomization seed")
     parser.add_argument('--jitter', default=False, action="store_true", help="Jitter preset augmentation")
     parser.add_argument('--scaling', default=False, action="store_true", help="Scaling preset augmentation")
     parser.add_argument('--permutation', default=False, action="store_true",
@@ -270,6 +287,13 @@ if __name__ == '__main__':
 
     if args.is_training:
         for ii in range(args.itr):
+            # Reseed before the model is built so that this repeat is defined
+            # entirely by its own seed, and name the run after the seed rather
+            # than the loop index so it stays identifiable when the repeats are
+            # run as separate jobs.
+            seed = args.seed + ii
+            set_seed(seed)
+
             # setting record of experiments
             exp = Exp(args)  # set experiments
             setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_expand{}_dc{}_fc{}_eb{}_dt{}_{}_{}'.format(
@@ -291,16 +315,17 @@ if __name__ == '__main__':
                 args.factor,
                 args.embed,
                 args.distil,
-                args.des, ii)
+                args.des, seed)
             
             # Override setting for specific model to ensure proper checkpoint naming and logging
             if args.model == 'MambaSingleLayer' and args.task_name == 'classification':
                 setting = f'{args.task_name}_CLS_{args.model_id}_{args.model}_{args.data}_ft{args.features}' \
                         + f'_sl{args.seq_len}_ll{args.label_len}_pl{args.pred_len}_dm{args.d_model}_ds{args.d_ff}' \
                         + f'_expand{args.expand}_dc{args.d_conv}_nk{args.num_kernels}' \
-                        + f'_tvdt{int(args.tv_dt)}_tvB{int(args.tv_B)}_tvC{int(args.tv_C)}_useD{int(args.use_D)}_{args.des}_{ii}'
+                        + f'_tvdt{int(args.tv_dt)}_tvB{int(args.tv_B)}_tvC{int(args.tv_C)}_useD{int(args.use_D)}_{args.des}_{seed}'
 
-            print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
+            print('>>>>>>>start training (run {}/{}, seed {}) : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(
+                ii + 1, args.itr, seed, setting))
             exp.train(setting)
 
             print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
@@ -311,8 +336,10 @@ if __name__ == '__main__':
                 elif args.gpu_type == 'cuda':
                     torch.cuda.empty_cache()
     else:
+        # Test-only: rebuild the name of the training run to load, which is now
+        # keyed by seed, so --seed selects which repeat is being evaluated.
+        set_seed(args.seed)
         exp = Exp(args)  # set experiments
-        ii = 0
         setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_expand{}_dc{}_fc{}_eb{}_dt{}_{}_{}'.format(
             args.task_name,
             args.model_id,
@@ -332,14 +359,14 @@ if __name__ == '__main__':
             args.factor,
             args.embed,
             args.distil,
-            args.des, ii)
+            args.des, args.seed)
         
         # Override setting for specific model to ensure proper checkpoint naming and logging
         if args.model == 'MambaSingleLayer' and args.task_name == 'classification':
             setting = f'{args.task_name}_CLS_{args.model_id}_{args.model}_{args.data}_ft{args.features}' \
                     + f'_sl{args.seq_len}_ll{args.label_len}_pl{args.pred_len}_dm{args.d_model}_ds{args.d_ff}' \
                     + f'_expand{args.expand}_dc{args.d_conv}_nk{args.num_kernels}' \
-                    + f'_tvdt{args.tv_dt}_tvB{args.tv_B}_tvC{args.tv_C}_useD{int(args.use_D)}_{args.des}_{ii}'
+                    + f'_tvdt{args.tv_dt}_tvB{args.tv_B}_tvC{args.tv_C}_useD{int(args.use_D)}_{args.des}_{args.seed}'
 
         print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
         exp.test(setting, test=1)

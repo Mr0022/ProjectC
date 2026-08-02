@@ -41,6 +41,7 @@ def print_args(args):
 
     print("\033[1m" + "Run Parameters" + "\033[0m")
     print(f'  {"Num Workers:":<20}{args.num_workers:<20}{"Itr:":<20}{args.itr:<20}')
+    print(f'  {"Base Seed:":<20}{args.seed:<20}{"Seeds:":<20}{str(list(range(args.seed, args.seed + args.itr))):<20}')
     print(f'  {"Train Epochs:":<20}{args.train_epochs:<20}{"Batch Size:":<20}{args.batch_size:<20}')
     print(f'  {"Patience:":<20}{args.patience:<20}{"Learning Rate:":<20}{args.learning_rate:<20}')
     print(f'  {"Des:":<20}{args.des:<20}{"Loss:":<20}{args.loss:<20}')
