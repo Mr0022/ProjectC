@@ -42,6 +42,11 @@ class Model(nn.Module):
         self.task_name = configs.task_name
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
+        # Patch geometry is the main architectural knob of PatchTST, so read it
+        # off the config when it is there and fall back to the signature
+        # defaults (16/8) otherwise -- existing callers keep the old geometry.
+        patch_len = getattr(configs, 'patch_len', patch_len)
+        stride = getattr(configs, 'stride', stride)
         padding = stride
 
         # patching and embedding

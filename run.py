@@ -47,7 +47,14 @@ def summarize_runs(runs, seeds):
     print("\n" + "=" * 72 + "\n" + "\n".join(lines) + "\n" + "=" * 72)
 
 
-if __name__ == '__main__':
+def build_parser():
+    """Build the command-line parser.
+
+    Kept as a function so that other entry points -- notably the Optuna driver
+    in tuning/ -- can obtain the exact same defaults instead of re-declaring
+    them. A tuner that builds its configurations through this parser can only
+    ever produce settings that `python -u run.py` reproduces verbatim.
+    """
     parser = argparse.ArgumentParser(description='TimesNet')
 
     # basic config
@@ -208,13 +215,31 @@ if __name__ == '__main__':
                         help="Discrimitive shapeDTW warp preset augmentation")
     parser.add_argument('--extra_tag', type=str, default="", help="Anything extra")
 
-    # TimeXer
+    # TimeXer / PatchTST
     parser.add_argument('--patch_len', type=int, default=16, help='patch length')
+    parser.add_argument('--stride', type=int, default=8,
+                        help='patch stride for PatchTST (stride < patch_len gives overlapping '
+                             'patches; stride == patch_len gives disjoint ones)')
 
     # Patch-based conv models (ModernTCN / TSLANet)
     parser.add_argument('--patch_size', type=int, default=16, help='patch size for ModernTCN/TSLANet')
     parser.add_argument('--patch_stride', type=int, default=8, help='patch stride for ModernTCN')
     parser.add_argument('--head_dropout', type=float, default=0.0, help='head dropout for ModernTCN')
+    # ModernTCN backbone. The lists are per-stage and must all have the same
+    # length; that length is the number of stages. The model's own head is
+    # built for a single stage (use_multi_scale keeps the pre-downsampling
+    # patch count), so keep them one element long unless the head is changed
+    # too. large_size/small_size must be ODD -- the depth-wise convolution pads
+    # by kernel//2 and an even kernel would shorten the patch axis and break
+    # the residual reshape -- and small_size must not exceed large_size.
+    parser.add_argument('--ffn_ratio', type=int, default=1,
+                        help='ModernTCN ConvFFN expansion ratio (d_ffn = d_model * ffn_ratio)')
+    parser.add_argument('--num_blocks', type=int, nargs='+', default=[1],
+                        help='ModernTCN blocks per stage, e.g. --num_blocks 2')
+    parser.add_argument('--large_size', type=int, nargs='+', default=[13],
+                        help='ModernTCN large depth-wise kernel per stage (odd)')
+    parser.add_argument('--small_size', type=int, nargs='+', default=[5],
+                        help='ModernTCN small re-param kernel per stage (odd, <= large_size)')
 
     # FITS
     parser.add_argument('--cut_freq', type=int, default=0,
@@ -250,7 +275,18 @@ if __name__ == '__main__':
     parser.add_argument('--top_p', type=float, default=0.5, help='Dynamic Routing in MoE')
     parser.add_argument('--pos', type=int, choices=[0, 1], default=1, help='Positional Embedding. Set pos to 0 or 1')
 
-    args = parser.parse_args()
+    return parser
+
+
+def finalize_args(args, parser=None):
+    """Apply the cross-flag rules and pick the device.
+
+    Split out of the entry point for the same reason as build_parser: the
+    tuner has to run the identical checks, or a configuration could train
+    under settings that run.py would have rejected or silently amended.
+    `parser` is optional; without one a rejected configuration raises
+    ValueError instead of exiting the process.
+    """
 
     # --aggregate_mean means "the target is an average of variances", which only
     # makes sense for a strictly positive series, and --log needs positivity for
@@ -269,10 +305,13 @@ if __name__ == '__main__':
     # block. Upstream leaves the default at 0 and relies on every script passing
     # the flag; fail loudly here instead so the cause is obvious.
     if args.model == 'TimeMixer' and args.down_sampling_layers < 1:
-        parser.error(
+        message = (
             "TimeMixer is a multi-scale model and needs --down_sampling_layers "
             ">= 1 (upstream uses 3). Re-run with e.g. --down_sampling_layers 3 "
             "--down_sampling_window 2 --down_sampling_method avg.")
+        if parser is not None:
+            parser.error(message)
+        raise ValueError(message)
 
     if torch.cuda.is_available() and args.use_gpu:
         args.device = torch.device('cuda:{}'.format(args.gpu))
@@ -289,6 +328,14 @@ if __name__ == '__main__':
         device_ids = args.devices.split(',')
         args.device_ids = [int(id_) for id_ in device_ids]
         args.gpu = args.device_ids[0]
+
+    return args
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    finalize_args(args, parser)
 
     print('Args in experiment:')
     print_args(args)
@@ -414,3 +461,7 @@ if __name__ == '__main__':
                 torch.backends.mps.empty_cache()
             elif args.gpu_type == 'cuda':
                 torch.cuda.empty_cache()
+
+
+if __name__ == '__main__':
+    main()
