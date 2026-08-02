@@ -334,12 +334,18 @@ WFTNet ≈ TimesNet.
 
 ## 6. Google Colab
 
-`tuning/colab_tune.ipynb` — open it from Colab (File → Open notebook → GitHub,
-or upload it). It mounts Drive, clones this private repo with a token you
-enter at the prompt, installs the handful of packages Colab lacks (`ptwt`,
-`fast_pytorch_kmeans`, `reformer-pytorch`, `local-attention`, `optuna`), runs
-the 50-trial search per model, then the `--itr 5` final runs, and prints a
-ranked summary table.
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Mr0022/ProjectC/blob/claude/optuna-hyperparameter-tuning-11-models-hc0tgt/tuning/colab_tune.ipynb)
+
+`tuning/colab_tune.ipynb` — click the badge, or File → Open notebook → GitHub →
+`Mr0022/ProjectC`. The repo is public, so no credentials are involved. It
+mounts Drive, clones the repo, installs the handful of packages Colab lacks
+(`ptwt`, `fast_pytorch_kmeans`, `reformer-pytorch`, `local-attention`,
+`optuna`), runs the 50-trial × 3-seed search per model, then the `--itr 5`
+final runs, and prints a ranked summary table.
+
+The badge and the notebook's `BRANCH` both point at
+`claude/optuna-hyperparameter-tuning-11-models-hc0tgt`; change them to `main`
+once this is merged.
 
 Studies live in `optuna.db` on Drive, so a disconnected session is resumed by
 re-running the setup cells and the search cell — a model that already has its
