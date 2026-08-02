@@ -25,6 +25,7 @@ the same command resumes rather than restarts.
 | `label_len` | 48 | decoder start token; none of the eleven has a real decoder, so it only sizes the unused `dec_inp` |
 | `features` / `enc_in` | `S` / 1 | univariate `RV` |
 | `train_epochs` / `patience` | 30 / 5 | early stopping, not epoch count, controls capacity |
+| repeats per trial | **3** (`--n_seeds`, alias `--itr`) | each configuration is trained 3× (seeds 2021–2023) and scored by the **mean** |
 | loss / selection | MSE on validation | test split is never read during a study |
 
 With `--aggregate_mean` (on by default in the driver) at `h = 1` the target is
@@ -236,9 +237,14 @@ halve the feature axis and mismatch it.
 
 ## 4. Trial budget
 
-**50 trials for every model** — an equal budget, so the table compares
-architectures rather than how long each search ran. TPE spends the first 10 on
-random startup, leaving 40 model-guided ones.
+**50 trials for every model, 3 repeats each** — an equal budget, so the table
+compares architectures rather than how long each search ran. TPE spends the
+first 10 trials on random startup, leaving 40 model-guided ones.
+
+Each trial trains 3 times, so a model's search is up to 150 trainings — fewer
+in practice, because a trial pruned on its first seed never pays for the other
+two. `--n_seeds 1` searches roughly three times faster if you only want an
+indicative ranking.
 
 | Model | Discrete grid | Continuous | Trials |
 |---|---|---|---|
@@ -260,13 +266,30 @@ sample for MSGNet and TimeMixer. That is the price of an equal protocol, and
 it is the right price to pay for a comparison; the alternative biases the
 table towards whichever model was searched hardest.
 
-## 4b. The final run: `--itr 5`
+## 4b. Repeats: 3 during the search, 5 for the final run
 
-`--retrain_best` re-runs the winning configuration through `run.py` with
-`--itr 5`, i.e. five independent seeds (2021–2025). `run.py` reseeds *before*
-each model is built, so a repeat is defined entirely by its own seed, and
-`summarize_runs` then prints mean ± std, min and max for every HAR-comparable
-metric:
+Two separate mechanisms, both seeded as `--seed + i` so they follow the same
+scheme `run.py` uses:
+
+| | During the search | Final run |
+|---|---|---|
+| Flag | `--n_seeds 3` (alias `--itr`) | `--retrain_itr 5` → `run.py --itr 5` |
+| Seeds | 2021, 2022, 2023 | 2021 … 2025 |
+| Split | validation | test |
+| Reduction | **mean** → the value TPE minimises | mean ± std, min, max |
+| Chooses the winner? | yes | no |
+
+Each trial's per-seed losses and their standard deviation are stored as trial
+attributes (`seed_scores`, `seed_std`) and copied into the results JSON for the
+winner, so a close ranking can be checked against how noisy the configurations
+actually were. Typical spread on this dataset is ±0.004 in `ln(RV)` MSE —
+comparable to the gap between neighbouring configurations, which is exactly
+why a single run is not enough to rank on.
+
+`--retrain_best` then re-runs the winner through `run.py` with `--itr 5`.
+`run.py` reseeds *before* each model is built, so a repeat is defined entirely
+by its own seed, and `summarize_runs` prints mean ± std, min and max for every
+HAR-comparable metric:
 
 ```
   MEAN OVER 5 RUNS   seeds 2021-2025
@@ -295,9 +318,12 @@ WFTNet ≈ TimesNet.
   the winning command line is written into `tuning/results/<Model>_best.json`.
   Verified: re-running an emitted command reproduces the trial's validation
   loss to the last digit.
-* **Noise** — 519 validation windows is a small sample; differences below
-  ~1 % of the loss are seed noise. Use `--n_seeds 2` or `3` to average each
-  configuration over seeds when the ranking matters (cost scales linearly).
+* **Noise** — 519 validation windows is a small sample, which is why each
+  trial is averaged over 3 seeds by default. Even so, treat differences below
+  a configuration's own `seed_std` as a tie rather than a ranking.
+* **Pruning with repeats** — only the first seed reports its epoch curve to
+  the pruner. A trial cut off there never runs its remaining seeds, so a bad
+  configuration still costs about one training, not three.
 * **Failures are pruned, not fatal** — a config that hits a shape or assertion
   error is recorded (`trial.user_attrs['error']`) and pruned so the study
   continues. All eleven spaces were validated by building and forward-passing

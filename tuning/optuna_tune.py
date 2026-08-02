@@ -5,9 +5,12 @@
 
 Selection is on VALIDATION loss -- specifically the smallest validation loss
 seen during training, which is exactly the epoch EarlyStopping checkpoints, so
-the number being minimised is the one the saved model achieves. The test split
-is never read during a study; `--retrain_best` afterwards trains the winning
-configuration once more and prints the HAR-comparable test metrics.
+the number being minimised is the one the saved model achieves. Each trial is
+trained --n_seeds times (3 by default, i.e. run.py's --itr applied during the
+search) and scored by the MEAN of those runs, because a single run on a
+519-window validation split is too noisy to rank configurations on. The test
+split is never read during a study; --retrain_best afterwards trains the
+winning configuration with --itr 5 and prints the HAR-comparable test metrics.
 
 Configurations are built by run.py's own parser, so every trial corresponds to
 a `python -u run.py ...` command line, which is written into the results JSON
@@ -193,7 +196,9 @@ def make_objective(args, model, checkpoint_root):
             for i in range(args.n_seeds):
                 # Repeats share the trial's pruning stream, so only the first
                 # seed reports intermediate values; later ones would restart
-                # the epoch counter and confuse the pruner.
+                # the epoch counter and confuse the pruner. A trial pruned on
+                # its first seed therefore never pays for the rest, which is
+                # what keeps repeated training affordable.
                 _ReportingEarlyStopping.enabled = (i == 0)
                 scores.append(train_once(cli_args, args.seed + i, checkpoint_root))
         except optuna.TrialPruned:
@@ -208,6 +213,12 @@ def make_objective(args, model, checkpoint_root):
             _ReportingEarlyStopping.enabled = True
             shutil.rmtree(checkpoint_root, ignore_errors=True)
 
+        # The trial's score is the MEAN over its seeds. The per-seed values and
+        # their spread are kept as attributes so a suspiciously close ranking
+        # can be checked against how noisy each configuration actually was.
+        trial.set_user_attr('seed_scores', [round(s, 6) for s in scores])
+        if len(scores) > 1:
+            trial.set_user_attr('seed_std', round(float(np.std(scores, ddof=1)), 6))
         return float(np.mean(scores))
 
     return objective
@@ -249,6 +260,9 @@ def tune_model(args, model):
         'pred_len': FIXED_PROTOCOL['pred_len'],
         'label_len': FIXED_PROTOCOL['label_len'],
         'best_val_loss': best.value,
+        'n_seeds': args.n_seeds,
+        'best_val_loss_per_seed': best.user_attrs.get('seed_scores'),
+        'best_val_loss_std': best.user_attrs.get('seed_std'),
         'best_params': best.user_attrs.get('params', best.params),
         'command': best.user_attrs.get('command'),
         'n_trials': len(study.trials),
@@ -292,10 +306,13 @@ def main():
                              'between architectures and not between search efforts')
     parser.add_argument('--timeout', type=float, default=None,
                         help='per-model wall-clock budget in seconds')
-    parser.add_argument('--n_seeds', type=int, default=1,
-                        help='train each configuration this many times and average; '
-                             '2-3 buys a much less noisy ranking on this small '
-                             'validation split, at a proportional cost')
+    parser.add_argument('--n_seeds', '--itr', type=int, default=3,
+                        help='repeats per trial: each configuration is trained this many '
+                             'times (seeds --seed, +1, +2 ...) and scored by the MEAN of '
+                             'its validation losses. This is run.py --itr applied during '
+                             'the search. 3 is the default because 519 validation windows '
+                             'make a single run too noisy to rank on; 1 searches three '
+                             'times faster if the ranking is only indicative')
     parser.add_argument('--seed', type=int, default=2021)
     parser.add_argument('--train_epochs', type=int, default=30)
     parser.add_argument('--patience', type=int, default=5)
