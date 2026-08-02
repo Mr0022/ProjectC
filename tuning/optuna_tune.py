@@ -214,7 +214,8 @@ def make_objective(args, model, checkpoint_root):
 
 
 def tune_model(args, model):
-    checkpoint_root = os.path.join(args.out_dir, '_checkpoints', model)
+    checkpoint_root = os.path.join(args.checkpoint_dir or
+                                   os.path.join(args.out_dir, '_checkpoints'), model)
     storage = f'sqlite:///{os.path.join(args.out_dir, "optuna.db")}'
     study = optuna.create_study(
         study_name=f'{args.study_prefix}_{model}',
@@ -286,7 +287,9 @@ def main():
         description='Optuna hyper-parameter search, seq_len=96 / pred_len=1')
     parser.add_argument('--model', default='all',
                         help="model name, or 'all' for every model in the registry")
-    parser.add_argument('--n_trials', type=int, default=50)
+    parser.add_argument('--n_trials', type=int, default=50,
+                        help='same budget for every model, so the comparison is '
+                             'between architectures and not between search efforts')
     parser.add_argument('--timeout', type=float, default=None,
                         help='per-model wall-clock budget in seconds')
     parser.add_argument('--n_seeds', type=int, default=1,
@@ -299,10 +302,18 @@ def main():
     parser.add_argument('--n_startup_trials', type=int, default=10)
     parser.add_argument('--n_warmup_steps', type=int, default=5)
     parser.add_argument('--out_dir', default='./tuning/results')
+    parser.add_argument('--checkpoint_dir', default=None,
+                        help='where trials write their per-epoch checkpoints; defaults to '
+                             '<out_dir>/_checkpoints. Point it at local disk when out_dir '
+                             'lives on a network mount such as Google Drive -- the files '
+                             'are rewritten every improving epoch and deleted per trial')
     parser.add_argument('--study_prefix', default='rv')
     parser.add_argument('--retrain_best', action='store_true',
                         help='after the search, train the winner and print test metrics')
-    parser.add_argument('--retrain_itr', type=int, default=3)
+    parser.add_argument('--retrain_itr', type=int, default=5,
+                        help='seeds for the final run (run.py --itr). Five repeats give '
+                             'the mean +/- std that a benchmark table should carry; a '
+                             'single run sits closer to a best case than to a mean')
 
     # Dataset / protocol passthrough.
     parser.add_argument('--data', default='custom')

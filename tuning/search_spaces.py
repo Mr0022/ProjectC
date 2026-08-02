@@ -67,13 +67,19 @@ MODELS = (
 # ---------------------------------------------------------------------------
 # Shared blocks
 # ---------------------------------------------------------------------------
-def _optimisation(trial, lr_range=(1e-4, 1e-2)):
-    """Settings every model shares.
+def _optimisation(trial):
+    """Settings every model shares -- IDENTICAL for all eleven.
 
-    learning_rate spans two decades on a log scale, which is where Adam lives
-    for this family of models. Purely linear models (DLinear, FITS) get a
-    wider upper bound from their caller -- with a few hundred parameters they
-    tolerate, and need, a far larger step.
+    Every model gets the same optimiser budget, so a benchmark table compares
+    architectures rather than how generously each one was tuned. That means
+    the learning-rate range is the UNION of what the family needs rather than
+    a per-model choice: 1e-4 to 5e-2, log-uniform. The upper end exists for
+    DLinear and FITS, which have a few hundred parameters and want a far
+    larger step than a transformer; the deep models will simply learn that the
+    top of the range diverges and TPE will stop proposing it, at the cost of a
+    handful of early trials. Restricting them instead would hand the linear
+    models a range their competitors never see, which is exactly the asymmetry
+    an equal protocol is meant to remove.
 
     batch_size stops at 128 on purpose: the train/val loaders are built with
     drop_last=True, and the validation split only holds a few hundred windows,
@@ -87,7 +93,7 @@ def _optimisation(trial, lr_range=(1e-4, 1e-2)):
     interacts strongly with the learning rate, so they are searched together.
     """
     return {
-        'learning_rate': trial.suggest_float('learning_rate', *lr_range, log=True),
+        'learning_rate': trial.suggest_float('learning_rate', 1e-4, 5e-2, log=True),
         'batch_size': trial.suggest_categorical('batch_size', [16, 32, 64, 128]),
         'lradj': trial.suggest_categorical('lradj', ['type1', 'type3', 'cosine']),
     }
@@ -137,7 +143,7 @@ def dlinear(trial):
     """
     return {
         'moving_avg': trial.suggest_categorical('moving_avg', [5, 13, 25, 49]),
-        **_optimisation(trial, lr_range=(1e-4, 5e-2)),
+        **_optimisation(trial),
     }
 
 
@@ -345,7 +351,7 @@ def fits(trial):
     """
     return {
         'cut_freq': trial.suggest_int('cut_freq', 3, 49),
-        **_optimisation(trial, lr_range=(1e-4, 5e-2)),
+        **_optimisation(trial),
     }
 
 

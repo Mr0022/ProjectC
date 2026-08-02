@@ -4,10 +4,11 @@ Search spaces and an Optuna driver for the eleven long-term forecasters in
 `models/`, calibrated for the shipped EUR/USD realized-variance series.
 
 ```bash
-python tuning/optuna_tune.py --model DLinear --n_trials 60      # one model
-python tuning/optuna_tune.py --model all --n_trials 60          # all eleven
-python tuning/optuna_tune.py --model FITS --n_trials 60 --retrain_best
+python tuning/optuna_tune.py --model DLinear                       # one model, 50 trials
+python tuning/optuna_tune.py --model all --retrain_best            # all eleven, then --itr 5
 ```
+
+On Colab, open `tuning/colab_tune.ipynb` (see §7).
 
 Run from the repository root (`exp_basic` discovers models by scanning the
 relative path `models/`). Studies live in `tuning/results/optuna.db`; re-running
@@ -36,9 +37,12 @@ Splits are chronological and fixed by the loader: train ≤ 2022, validation
 
 ## 2. Shared across all eleven
 
+Identical for all eleven — no model gets a range another one lacks, so the
+resulting table compares architectures rather than search effort.
+
 | Parameter | Range | Why |
 |---|---|---|
-| `learning_rate` | log-uniform `1e-4 … 1e-2` | `1e-4 … 5e-2` for the two linear models (DLinear, FITS), which have hundreds of parameters and need bigger steps |
+| `learning_rate` | log-uniform `1e-4 … 5e-2` | the UNION of what the family needs. The top of the range exists for DLinear/FITS (a few hundred parameters, much larger steps); the deep models learn within a few trials that it diverges and TPE stops proposing it |
 | `batch_size` | {16, 32, 64, 128} | capped at 128: the train/val loaders use `drop_last=True` and validation holds only 519 windows |
 | `lradj` | {`type1`, `type3`, `cosine`} | not cosmetic — `type1` *halves* the LR every epoch (≈8 useful epochs whatever the budget), `type3` holds 3 epochs then decays 0.9×, `cosine` anneals over the full budget. Strongly coupled to `learning_rate`, so searched jointly |
 
@@ -230,26 +234,49 @@ halve the feature axis and mismatch it.
 `n_clusters` is excluded — the model clamps it to `min(n_clusters, enc_in) = 1`.
 `sr_ratio` (super-resolution only) and `factor` (ProbAttention only) likewise.
 
-## 4. Suggested trial budgets
+## 4. Trial budget
 
-Scaled to the discrete size of each space; TPE needs roughly 10 startup trials
-before its model beats random.
+**50 trials for every model** — an equal budget, so the table compares
+architectures rather than how long each search ran. TPE spends the first 10 on
+random startup, leaving 40 model-guided ones.
 
-| Model | Discrete grid | Continuous | Suggested trials |
+| Model | Discrete grid | Continuous | Trials |
 |---|---|---|---|
-| DLinear | 48 | lr | 30 |
-| TSLANet | 432 | lr, dropout | 40 |
-| FITS | 564 | lr | 40 |
+| DLinear | 48 | lr | 50 |
+| TSLANet | 432 | lr, dropout | 50 |
+| FITS | 564 | lr | 50 |
 | iTransformer | 2,592 | lr, dropout | 50 |
 | TimesNet | 2,916 | lr, dropout | 50 |
-| WFTNet | 7,776 | lr, dropout, period_coeff | 60 |
-| PatchTST | 15,552 | lr, dropout | 60 – 80 |
-| AdaWaveNet | 15,552 | lr, dropout, regu_details, regu_approx | 60 – 80 |
-| ModernTCN | 31,104 | lr, dropout, head_dropout | 60 – 80 |
-| MSGNet | 157,464 | lr, dropout, propalpha | 80 |
-| TimeMixer | 209,952 (139,968 after the divisibility clamp) | lr, dropout | 80 |
+| WFTNet | 7,776 | lr, dropout, period_coeff | 50 |
+| PatchTST | 15,552 | lr, dropout | 50 |
+| AdaWaveNet | 15,552 | lr, dropout, regu_details, regu_approx | 50 |
+| ModernTCN | 31,104 | lr, dropout, head_dropout | 50 |
+| MSGNet | 157,464 | lr, dropout, propalpha | 50 |
+| TimeMixer | 209,952 (139,968 after the divisibility clamp) | lr, dropout | 50 |
 
-Grid sizes include the shared `batch_size` × `lradj` factor of 12.
+Grid sizes include the shared `batch_size` × `lradj` factor of 12. The coverage
+50 trials buys is therefore very uneven — near-exhaustive for DLinear, a thin
+sample for MSGNet and TimeMixer. That is the price of an equal protocol, and
+it is the right price to pay for a comparison; the alternative biases the
+table towards whichever model was searched hardest.
+
+## 4b. The final run: `--itr 5`
+
+`--retrain_best` re-runs the winning configuration through `run.py` with
+`--itr 5`, i.e. five independent seeds (2021–2025). `run.py` reseeds *before*
+each model is built, so a repeat is defined entirely by its own seed, and
+`summarize_runs` then prints mean ± std, min and max for every HAR-comparable
+metric:
+
+```
+  MEAN OVER 5 RUNS   seeds 2021-2025
+  MSE [ln]   : 0.282285 +/- 0.003725   [min 0.277683, max 0.285736]
+  QLIKE [RV] : 0.164766 +/- 0.003517   [min 0.159301, max 0.168441]
+  MSE_RV     : 0.042002 +/- 0.000862   [min 0.041038, max 0.043336]
+```
+
+That spread is the initialisation noise of the configuration and belongs in
+the benchmark table — a single run sits closer to a best case than to a mean.
 
 Order of cost per trial (cheapest first): FITS ≈ DLinear ≪ TSLANet <
 PatchTST ≈ iTransformer ≈ ModernTCN < TimeMixer ≈ AdaWaveNet < MSGNet <
@@ -279,7 +306,22 @@ WFTNet ≈ TimesNet.
 * **Disk** — trial checkpoints go to `tuning/results/_checkpoints/` and are
   deleted after each trial. `tuning/results/` is already git-ignored.
 
-## 6. Extending to multivariate (`--features M`)
+## 6. Google Colab
+
+`tuning/colab_tune.ipynb` — open it from Colab (File → Open notebook → GitHub,
+or upload it). It mounts Drive, clones this private repo with a token you
+enter at the prompt, installs the handful of packages Colab lacks (`ptwt`,
+`fast_pytorch_kmeans`, `reformer-pytorch`, `local-attention`, `optuna`), runs
+the 50-trial search per model, then the `--itr 5` final runs, and prints a
+ranked summary table.
+
+Studies live in `optuna.db` on Drive, so a disconnected session is resumed by
+re-running the setup cells and the search cell — a model that already has its
+50 trials returns immediately. Checkpoints are pointed at local disk with
+`--checkpoint_dir /content/_ckpt`; they are rewritten every improving epoch,
+and on a Drive mount that would dominate the runtime.
+
+## 7. Extending to multivariate (`--features M`)
 
 Three knobs deliberately excluded because `enc_in = 1` makes them no-ops:
 `individual` (DLinear takes it as a constructor argument, FITS and ModernTCN
