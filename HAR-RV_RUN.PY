@@ -135,10 +135,15 @@ output. Each of these is what --log exists to address:
      QLIKE are far more robust here and should carry the weight.
   3. Fitted values are no longer positive by construction. A levels OLS can
      and does predict RV < 0 in calm periods, which is meaningless as a
-     variance and undefined under QLIKE. Non-positive forecasts are counted,
-     reported per horizon, and floored before QLIKE is evaluated -- they are
-     never silently dropped, since dropping the worst forecasts would bias
-     QLIKE downward.
+     variance and undefined under QLIKE. Such forecasts are never silently
+     dropped -- dropping the worst ones would bias the losses downward -- and
+     are handled by scale rather than discarded:
+       * MSE and MAE score max(pred, 0), the best admissible forecast, since
+         a variance below zero is not a prediction the model could make.
+       * QLIKE is infinite at zero, so it floors them at a small positive
+         multiple of mean training RV instead.
+     They are counted and reported per horizon either way, so how much the
+     numbers lean on the guard stays visible.
   4. Losses are on the RV scale, so they are NOT comparable to the ln(RV)-scale
      numbers produced by --log. Any deep-learning baseline must be evaluated
      on whichever scale is being reported.
@@ -817,9 +822,16 @@ def compute_metrics(actual, predicted, floor: float,
         size of the correction is visible rather than taken on trust.
     """
     if not LOG_MODE:
+        # A negative variance forecast is not admissible, so MSE and MAE are
+        # measured against the clipped forecast max(pred, 0) -- the best
+        # feasible prediction the model could have issued. QLIKE cannot use
+        # zero (it is infinite there) and keeps the positive floor applied
+        # inside qlike(). The deep models are scored the same way, so the two
+        # tables stay comparable number for number.
+        pred_clipped = np.maximum(np.asarray(predicted, dtype=float), 0.0)
         q, n_bad = qlike(actual, predicted, floor)
-        return {"MSE"       : mse(actual, predicted),
-                "MAE"       : mae(actual, predicted),
+        return {"MSE"       : mse(actual, pred_clipped),
+                "MAE"       : mae(actual, pred_clipped),
                 "QLIKE"     : q,
                 "n_neg_pred": n_bad,
                 "pct_neg"   : 100.0 * n_bad / len(predicted)}

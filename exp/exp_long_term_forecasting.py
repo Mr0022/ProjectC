@@ -114,7 +114,11 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         raw mode -- preds/trues are already the h-day forward mean of RV, so
         MSE/MAE/QLIKE are raw-variance losses and line up with HAR-RV's
-        raw-scale table directly.
+        raw-scale table directly. Forecasts arrive clipped at zero (see test),
+        since a negative variance is not an admissible prediction; QLIKE is the
+        exception, being infinite at zero, and floors non-positive forecasts at
+        a small positive multiple of mean training RV instead. 'neg pred'
+        counts those, so how much QLIKE leans on the floor stays visible.
 
         --log -- preds/trues are ln(h-day forward mean of RV):
           * MSE/MAE are reported in ln(RV) units, the scale the network is
@@ -398,6 +402,22 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
         trues = trues.reshape(-1, trues.shape[-2], trues.shape[-1])
         print('test shape:', preds.shape, trues.shape)
+
+        # A variance forecast below zero is not admissible, so the model's best
+        # feasible prediction is zero and the raw-scale errors are measured
+        # against max(pred, 0). Only under --aggregate_mean WITHOUT --log are
+        # the predictions variances; under --log they are ln(RV), where a
+        # negative value is an ordinary variance below 1 and must be left
+        # alone. Clipping here rather than inside the metric keeps the headline
+        # mse:/mae: line, the HAR-comparable block and pred.npy consistent.
+        # QLIKE is unaffected: it is infinite at zero, so it keeps its own
+        # positive floor (see _report_rv_metrics).
+        if getattr(self.args, 'aggregate_mean', False) and not getattr(self.args, 'log', False):
+            n_clipped = int((preds < 0).sum())
+            if n_clipped:
+                print('clipped {} negative variance forecast(s) to 0 ({:.1f}%)'.format(
+                    n_clipped, 100.0 * n_clipped / preds.size))
+            preds = np.maximum(preds, 0.0)
 
         # result save
         folder_path = './results/' + setting + '/'
