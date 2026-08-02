@@ -51,8 +51,19 @@ class Dataset_Custom(Dataset):
     """
     Generic CSV dataset with a chronological year-based split.
 
-    Two options exist for realized-variance work, both off by default so that
-    every other dataset (ETT, Weather, Traffic, ...) is untouched:
+    scale -- standardise the feature columns with a StandardScaler fit on the
+             TRAIN split only, exactly as the Time-Series-Library does, and ON
+             by default to match upstream. When `log` is also set the order is
+             ln first, then standardise, so the scaler sees ln(RV).
+
+             The transform is applied to the SERIES, so everything this class
+             emits -- data_x and data_y -- is in z-space. Consumers that need
+             the modelling scale back (the HAR-comparable aggregation and
+             metrics in Exp_Long_Term_Forecast) must undo it; see
+             `scaler_stats` and `inverse_transform`.
+
+    Two further options exist for realized-variance work, both off by default
+    so that every other dataset (ETT, Weather, Traffic, ...) is untouched:
 
       log              -- replace the feature columns with their natural log,
                           so the network is trained on ln(RV) instead of RV.
@@ -70,7 +81,7 @@ class Dataset_Custom(Dataset):
 
     def __init__(self, root_path, flag='train', size=None,
                  features='S', data_path='ETTh1.csv',
-                 target='OT', scale=False, timeenc=0, freq='h',
+                 target='OT', scale=True, timeenc=0, freq='h',
                  log=False, drop_nonpositive=False):
         # size [seq_len, label_len, pred_len]
         # info
@@ -195,7 +206,19 @@ class Dataset_Custom(Dataset):
 
     def inverse_transform(self, data):
         return self.scaler.inverse_transform(data)
-    
+
+    @property
+    def scaler_stats(self):
+        """(mean, std) of the fitted scaler, or None when `scale` is off.
+
+        The scaler is always fit on the TRAIN split whatever `flag` this
+        instance was built with, so the train, val and test instances carry
+        identical constants and either one may be used to undo the transform.
+        """
+        if not self.scale:
+            return None
+        return self.scaler.mean_, self.scaler.scale_
+
 
 class Dataset_Pred(Dataset):
     def __init__(self, root_path, flag='pred', size=None,

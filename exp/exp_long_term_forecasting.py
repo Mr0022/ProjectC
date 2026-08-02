@@ -19,6 +19,11 @@ warnings.filterwarnings('ignore')
 class Exp_Long_Term_Forecast(Exp_Basic):
     def __init__(self, args):
         super(Exp_Long_Term_Forecast, self).__init__(args)
+        # Standardisation constants, cached from the dataset by _get_data.
+        # Stay None when the loader is not scaling (--scale 0), which turns
+        # every _unscale below into a no-op.
+        self._scale_mean = None
+        self._scale_std = None
 
     def _build_model(self):
         # Mean-aggregation: the model forecasts a SINGLE value -- the horizon
@@ -61,9 +66,14 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         mean-of-logs: averaging the logs would target a geometric forward mean,
         a smaller and much smoother quantity that would not line up with the
         raw-mode target or with HAR-RV.
+
+        When the loader standardises, the window arrives in z-space and is
+        mapped back first -- neither the arithmetic mean of variances nor the
+        log-of-mean is meaningful on standardised values.
         """
         y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
         if getattr(self.args, 'aggregate_mean', False):
+            y = self._unscale(y, f_dim)
             h = y.shape[1]
             if getattr(self.args, 'log', False):
                 # series is ln(RV): ln(mean(RV)) = logsumexp(ln_RV) - ln(h)
@@ -75,7 +85,48 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
     def _get_data(self, flag):
         data_set, data_loader = data_provider(self.args, flag)
+        # Cache the standardisation constants on first use. Dataset_Custom fits
+        # its scaler on the TRAIN split whatever `flag` asks for, so every split
+        # carries the same constants and whichever loader is built first wins.
+        stats = getattr(data_set, 'scaler_stats', None)
+        if stats is not None and self._scale_mean is None:
+            mean, std = stats
+            self._scale_mean = torch.tensor(mean, dtype=torch.float32,
+                                            device=self.device)
+            self._scale_std = torch.tensor(std, dtype=torch.float32,
+                                           device=self.device)
         return data_set, data_loader
+
+    def _unscale(self, x, f_dim):
+        """Undo the loader's standardisation, putting `x` back on the modelling
+        scale -- raw RV, or ln(RV) under --log.
+
+        Used only on the --aggregate_mean path. The HAR target
+        ln(mean(exp(.))) lives on that scale and does NOT commute with an
+        affine map, so the aggregation -- and every metric built on top of it,
+        including the QLIKE floor and the lognormal back-transform -- has to
+        happen after this. Without --aggregate_mean the loss stays in z-space
+        exactly as upstream does it, and --inverse handles the test-time map.
+
+        The transform is affine with a constant sigma, so the aggregated MSE is
+        just sigma^2 times its z-space counterpart: gradients rescale
+        uniformly and early stopping still selects the same epoch.
+        """
+        if self._scale_mean is None:
+            return x
+        return x * self._scale_std[f_dim:] + self._scale_mean[f_dim:]
+
+    def _pred_to_target_scale(self, outputs, f_dim):
+        """Put a forecast on the same scale as _get_target's return value.
+
+        The models de-normalise their own per-window RevIN internally, so their
+        output arrives in whatever space the loader handed them -- z-space when
+        scaling is on. That is the loader's transform, not the model's, so it
+        is ours to undo.
+        """
+        if getattr(self.args, 'aggregate_mean', False):
+            return self._unscale(outputs, f_dim)
+        return outputs
 
     def _forward_collect(self, loader):
         """Run the model over `loader` and return (preds, trues) as flat arrays
@@ -101,6 +152,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                outputs = self._pred_to_target_scale(outputs, f_dim)
                 target = self._get_target(batch_y, f_dim)
                 preds.append(outputs.detach().cpu().numpy().reshape(-1))
                 trues.append(target.detach().cpu().numpy().reshape(-1))
@@ -138,8 +190,15 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         trues = np.asarray(trues, dtype=float).reshape(-1)
 
         # QLIKE floor: same rule as HAR-RV_RUN.PY, 1e-4 * mean training RV.
+        # data_x is standardised whenever the loader scales, and a floor is a
+        # variance level, so undo that first -- on z-scores the mean collapses
+        # to ~0 and the floor with it. Then keep only the target column, which
+        # is the one the forecasts and QLIKE actually concern.
         train_data, train_loader = self._get_data(flag='train')
         train_series = np.asarray(train_data.data_x, dtype=float)
+        if getattr(train_data, 'scaler_stats', None) is not None:
+            train_series = train_data.inverse_transform(train_series)
+        train_series = train_series[:, (-1 if self.args.features == 'MS' else 0):]
         mean_train_rv = float(np.mean(np.exp(train_series) if log_mode
                                       else train_series))
         floor = 1e-4 * mean_train_rv
@@ -224,6 +283,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                outputs = self._pred_to_target_scale(outputs, f_dim)
                 batch_y = self._get_target(batch_y, f_dim)
 
                 pred = outputs.detach()
@@ -281,6 +341,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                         f_dim = -1 if self.args.features == 'MS' else 0
                         outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                        outputs = self._pred_to_target_scale(outputs, f_dim)
                         batch_y = self._get_target(batch_y, f_dim)
                         loss = criterion(outputs, batch_y)
                         train_loss.append(loss.item())
@@ -289,6 +350,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                     f_dim = -1 if self.args.features == 'MS' else 0
                     outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                    outputs = self._pred_to_target_scale(outputs, f_dim)
                     batch_y = self._get_target(batch_y, f_dim)
                     loss = criterion(outputs, batch_y)
                     train_loss.append(loss.item())
@@ -361,9 +423,14 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                 f_dim = -1 if self.args.features == 'MS' else 0
                 if getattr(self.args, 'aggregate_mean', False):
-                    # single-value forecast vs log(mean(RV)) target; no inverse
-                    # transform (aggregated target is not in the scaler's space)
+                    # Single-value forecast vs the log(mean(RV)) target. The
+                    # generic --inverse path below cannot serve this branch: it
+                    # un-scales a full pred_len window, while here the target is
+                    # already aggregated. _pred_to_target_scale applies the same
+                    # affine inverse to the scalar instead, so both sides reach
+                    # the RV/ln(RV) scale the HAR metrics are defined on.
                     outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                    outputs = self._pred_to_target_scale(outputs, f_dim)
                     batch_y = self._get_target(batch_y, f_dim)
                     outputs = outputs.detach().cpu().numpy()
                     batch_y = batch_y.detach().cpu().numpy()

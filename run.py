@@ -78,6 +78,13 @@ if __name__ == '__main__':
     parser.add_argument('--pred_len', type=int, default=96, help='prediction sequence length')
     parser.add_argument('--seasonal_patterns', type=str, default='Monthly', help='subset for M4')
     parser.add_argument('--inverse', action='store_true', help='inverse output data', default=False)
+    parser.add_argument('--scale', type=int, default=1,
+                        help='standardise the feature columns with a StandardScaler fit on the '
+                             'TRAIN split; 1 = on (the Time-Series-Library default), 0 = off. '
+                             'Under --log the series is logged first, so the scaler sees ln(RV). '
+                             'With --aggregate_mean the target and the forecast are mapped back '
+                             'to the RV/ln(RV) scale before the loss and the HAR-comparable '
+                             'metrics, so those numbers stay in RV units either way.')
     parser.add_argument('--aggregate_mean', action='store_true', default=False,
                         help='multi-horizon mean aggregation: the model forecasts a SINGLE value, '
                              'the pred_len-day forward average of RV -- mean(RV) in raw mode and '

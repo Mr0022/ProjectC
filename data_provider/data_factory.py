@@ -39,6 +39,8 @@ def data_provider(args, flag):
         target=args.target,
         timeenc=timeenc,
         freq=freq,
+        # Train-split StandardScaler, on by default like the Time-Series-Library.
+        scale=bool(getattr(args, 'scale', 1)),
     )
     # Realized-variance options; only Dataset_Custom understands them, and
     # both default to off so every other dataset behaves exactly as before.
