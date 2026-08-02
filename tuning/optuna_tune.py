@@ -241,10 +241,42 @@ def tune_model(args, model):
             n_startup_trials=args.n_startup_trials, n_warmup_steps=args.n_warmup_steps),
     )
 
+    # --n_trials is a TARGET for the study, not a batch size. Optuna's own
+    # n_trials counts trials run by this call, so a resumed session would add
+    # a second full batch on top of whatever the database already holds -- and
+    # re-search every model that had already finished. Count what is there and
+    # ask only for the remainder, which makes re-running the cell idempotent.
+    #
+    # Attempted, not completed, is the right thing to count: a pruned trial
+    # spent compute and taught the sampler something, exactly as it would have
+    # inside a single uninterrupted call of --n_trials.
+    finished = (optuna.trial.TrialState.COMPLETE,
+                optuna.trial.TrialState.PRUNED,
+                optuna.trial.TrialState.FAIL)
+    attempted = sum(t.state in finished for t in study.trials)
+    # Trials the previous session was midway through when it was killed stay
+    # RUNNING for ever. They produced no value, so they do not count towards
+    # the target; they are reported so the number is not a mystery later.
+    orphaned = sum(t.state == optuna.trial.TrialState.RUNNING for t in study.trials)
+    remaining = max(0, args.n_trials - attempted)
+
+    if attempted or orphaned:
+        note = f'[{model}] study already holds {attempted} trials'
+        if orphaned:
+            note += f' (+{orphaned} left RUNNING by an interrupted session, ignored)'
+        print(f'{note}; target {args.n_trials} -> running {remaining} more')
+
     started = time.time()
-    study.optimize(make_objective(args, model, checkpoint_root),
-                   n_trials=args.n_trials, timeout=args.timeout,
-                   gc_after_trial=True)
+    if remaining:
+        study.optimize(make_objective(args, model, checkpoint_root),
+                       n_trials=remaining, timeout=args.timeout,
+                       gc_after_trial=True)
+    else:
+        # Already at the target. Fall through anyway so the results file is
+        # rewritten -- a session killed mid-search leaves the database correct
+        # but the JSON stale or missing.
+        print(f'[{model}] already at the {args.n_trials}-trial target; '
+              f'refreshing the results file only')
     shutil.rmtree(checkpoint_root, ignore_errors=True)
 
     completed = [t for t in study.trials
@@ -302,8 +334,13 @@ def main():
     parser.add_argument('--model', default='all',
                         help="model name, or 'all' for every model in the registry")
     parser.add_argument('--n_trials', type=int, default=50,
-                        help='same budget for every model, so the comparison is '
-                             'between architectures and not between search efforts')
+                        help='TARGET number of trials per study, counting what the '
+                             'database already holds -- re-running tops a study up to '
+                             'this number instead of adding another full batch, and a '
+                             'study already at the target is skipped. Raise it to '
+                             'search further. The same budget for every model, so the '
+                             'comparison is between architectures and not between '
+                             'search efforts')
     parser.add_argument('--timeout', type=float, default=None,
                         help='per-model wall-clock budget in seconds')
     parser.add_argument('--n_seeds', '--itr', type=int, default=3,

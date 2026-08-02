@@ -11,8 +11,15 @@ python tuning/optuna_tune.py --model all --retrain_best            # all eleven,
 On Colab, open `tuning/colab_tune.ipynb` (see §7).
 
 Run from the repository root (`exp_basic` discovers models by scanning the
-relative path `models/`). Studies live in `tuning/results/optuna.db`; re-running
-the same command resumes rather than restarts.
+relative path `models/`). Studies live in `tuning/results/optuna.db`.
+
+**`--n_trials` is a target for the study, not a batch size.** Re-running the
+same command tops a study up to that number and skips one that already reached
+it, so an interrupted search is resumed by simply running it again — a model
+stopped at 30/50 runs 20 more, not another 50. Raising the number extends a
+finished study. Trials the previous session was midway through stay `RUNNING`
+in the database, produce nothing, and are not counted towards the target; they
+are reported on resume so the count is not a mystery.
 
 ---
 
@@ -331,6 +338,10 @@ WFTNet ≈ TimesNet.
   populated `error` attribute means something changed in `models/`.
 * **Disk** — trial checkpoints go to `tuning/results/_checkpoints/` and are
   deleted after each trial. `tuning/results/` is already git-ignored.
+* **Results files** — `<Model>_best.json` and `summary.json` are written when a
+  call finishes, so a session killed mid-search leaves them stale while the
+  database stays correct. Re-running rewrites them, and does so even when a
+  study is already at its trial target and no training happens.
 
 ## 6. Google Colab
 
