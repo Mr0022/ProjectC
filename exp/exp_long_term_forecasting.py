@@ -141,10 +141,14 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         floor = 1e-4 * mean_train_rv
 
         lines = []
+        metrics = {}
         if not log_mode:
             q, n_bad = QLIKE(preds, trues, floor)
-            lines += [f"  MSE        : {np.mean((trues - preds) ** 2):.6f}",
-                      f"  MAE        : {np.mean(np.abs(trues - preds)):.6f}",
+            metrics = {'MSE': float(np.mean((trues - preds) ** 2)),
+                       'MAE': float(np.mean(np.abs(trues - preds))),
+                       'QLIKE': q}
+            lines += [f"  MSE        : {metrics['MSE']:.6f}",
+                      f"  MAE        : {metrics['MAE']:.6f}",
                       f"  QLIKE      : {q:.6f}",
                       f"  neg pred   : {n_bad} ({100.0 * n_bad / len(preds):.1f}%)"]
         else:
@@ -161,12 +165,17 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             q, n_bad = QLIKE(actual_rv, pred_rv, floor)
             q_naive, _ = QLIKE(actual_rv, pred_naive, floor)
             shift = np.exp(bias + resid_var / 2.0)
+            metrics = {'MSE [ln]': float(np.mean((trues - preds) ** 2)),
+                       'MAE [ln]': float(np.mean(np.abs(trues - preds))),
+                       'QLIKE [RV]': q,
+                       'MSE_RV': float(np.mean((actual_rv - pred_rv) ** 2)),
+                       'MAE_RV': float(np.mean(np.abs(actual_rv - pred_rv)))}
             lines += [
-                f"  MSE  [ln]  : {np.mean((trues - preds) ** 2):.6f}",
-                f"  MAE  [ln]  : {np.mean(np.abs(trues - preds)):.6f}",
+                f"  MSE  [ln]  : {metrics['MSE [ln]']:.6f}",
+                f"  MAE  [ln]  : {metrics['MAE [ln]']:.6f}",
                 f"  QLIKE [RV] : {q:.6f}   (naive exp: {q_naive:.6f})",
-                f"  MSE_RV     : {np.mean((actual_rv - pred_rv) ** 2):.6f}",
-                f"  MAE_RV     : {np.mean(np.abs(actual_rv - pred_rv)):.6f}",
+                f"  MSE_RV     : {metrics['MSE_RV']:.6f}",
+                f"  MAE_RV     : {metrics['MAE_RV']:.6f}",
                 f"  back-trans : bias={bias:+.6f}  sigma^2={resid_var:.6f}  -> "
                 f"x{shift:.4f}",
                 f"  neg pred   : {n_bad} (0 by construction under --log)"]
@@ -178,6 +187,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         print("\n" + "=" * 72 + "\n" + block + "\n" + "=" * 72)
         with open("result_long_term_forecast.txt", 'a') as f:
             f.write(block + "\n\n")
+        return metrics
 
     def _select_optimizer(self):
         model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
@@ -422,11 +432,17 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         # report the losses the way HAR-RV_RUN.PY does (QLIKE, and the
         # back-transformed variance scale under --log) to make the two
         # directly comparable.
+        # Returned so run.py can average them over the --itr repeats. Under
+        # --aggregate_mean the HAR-comparable set replaces the plain one rather
+        # than extending it: it already carries MSE and MAE, on the scale the
+        # block above reports them, and adds QLIKE.
         if getattr(self.args, 'aggregate_mean', False):
-            self._report_rv_metrics(preds, trues, setting)
+            run_metrics = self._report_rv_metrics(preds, trues, setting)
+        else:
+            run_metrics = {'MSE': float(mse), 'MAE': float(mae)}
 
         np.save(folder_path + 'metrics.npy', np.array([mae, mse, rmse, mape, mspe]))
         np.save(folder_path + 'pred.npy', preds)
         np.save(folder_path + 'true.npy', trues)
 
-        return
+        return run_metrics

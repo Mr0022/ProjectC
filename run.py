@@ -23,6 +23,30 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
+def summarize_runs(runs, seeds):
+    """Average each test metric over the --itr repeats and print the result.
+
+    The repeats differ only in their seed, so the spread across them is the
+    initialisation noise of the configuration -- the number a benchmark table
+    should carry, since a single run sits closer to a best case than to a mean.
+    Only metrics reported by every repeat are averaged, and nothing is printed
+    for a single run, where there is no spread to report.
+    """
+    if len(runs) < 2:
+        return
+    keys = [k for k in runs[0] if all(k in r for r in runs)]
+    if not keys:
+        return
+
+    width = max(len(k) for k in keys)
+    lines = [f"  MEAN OVER {len(runs)} RUNS   seeds {seeds[0]}-{seeds[-1]}"]
+    for k in keys:
+        vals = np.array([r[k] for r in runs], dtype=float)
+        lines.append(f"  {k:<{width}} : {vals.mean():.6f} +/- {vals.std(ddof=1):.6f}"
+                     f"   [min {vals.min():.6f}, max {vals.max():.6f}]")
+    print("\n" + "=" * 72 + "\n" + "\n".join(lines) + "\n" + "=" * 72)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='TimesNet')
 
@@ -286,6 +310,7 @@ if __name__ == '__main__':
         Exp = Exp_Long_Term_Forecast
 
     if args.is_training:
+        runs, run_seeds = [], []
         for ii in range(args.itr):
             # Reseed before the model is built so that this repeat is defined
             # entirely by its own seed, and name the run after the seed rather
@@ -329,12 +354,19 @@ if __name__ == '__main__':
             exp.train(setting)
 
             print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
-            exp.test(setting)
+            # Tasks other than long-term forecasting still return None here, in
+            # which case there is nothing to average and the summary is skipped.
+            run_metrics = exp.test(setting)
+            if run_metrics:
+                runs.append(run_metrics)
+                run_seeds.append(seed)
             if args.use_gpu:
                 if args.gpu_type == 'mps':
                     torch.backends.mps.empty_cache()
                 elif args.gpu_type == 'cuda':
                     torch.cuda.empty_cache()
+
+        summarize_runs(runs, run_seeds)
     else:
         # Test-only: rebuild the name of the training run to load, which is now
         # keyed by seed, so --seed selects which repeat is being evaluated.
