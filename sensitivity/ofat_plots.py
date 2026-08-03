@@ -397,17 +397,22 @@ def figure_panels(model, tables, anchor_stat, metric, scale_name, best, out_base
         axes[row][0].set_ylabel(METRIC_LABEL.get(metric, {}).get(scale_name, metric),
                                 fontsize=8.5)
 
-    seeds = anchor_stat['n'] if anchor_stat else 0
+    seeds = anchor_stat['n'] if anchor_stat else max(
+        int(t['n'].max()) for t in tables.values())
     handles = [
         Line2D([], [], color=BLUE, lw=2.0, marker='o', ms=5, mec=SURFACE, mew=1.2,
                label='swept value: mean over seeds'),
         Patch(facecolor=BLUE, alpha=0.16, label='+/- 1 sd over seeds'),
-        Line2D([], [], color=ANCHOR, lw=1.1, ls=(0, (4, 3)), marker='*', ms=11,
-               mec=SURFACE, label='tuned anchor'),
-        Patch(facecolor=BLUE_PALE, alpha=0.8, label='anchor +/- 1 sd (seed noise)'),
         Line2D([], [], ls='none', marker='o', ms=2.8, color=MUTED,
                label='individual seeds'),
     ]
+    if anchor_stat:      # nothing anchor-shaped is drawn without an anchor run
+        handles[2:2] = [
+            Line2D([], [], color=ANCHOR, lw=1.1, ls=(0, (4, 3)), marker='*', ms=11,
+                   mec=SURFACE, label='tuned anchor'),
+            Patch(facecolor=BLUE_PALE, alpha=0.8,
+                  label='anchor +/- 1 sd (seed noise)'),
+        ]
     _header(fig,
             f'{model} — one-factor-at-a-time hyper-parameter sensitivity',
             f"EUR/USD realised variance · seq_len {best['seq_len']} · "
@@ -436,7 +441,11 @@ def figure_tornado(summary, metric, scale_name, out_base, formats, dpi):
     for index, (ax, model) in enumerate(zip(axes.ravel(), models)):
         rows = summary[summary['model'] == model].sort_values('span_pct')
         y = np.arange(len(rows))
-        above = rows['span_pct'].to_numpy() > rows['noise_pct'].to_numpy()
+        # No anchor row in the CSV means the noise level is unknown, not zero:
+        # leave those bars plain rather than claiming "within noise".
+        noise_col = rows['noise_pct'].to_numpy(dtype=float)
+        known = np.isfinite(noise_col)
+        above = ~known | (rows['span_pct'].to_numpy() > noise_col)
         ax.barh(y, rows['span_pct'], height=0.66,
                 color=[BLUE if a else BLUE_PALE for a in above],
                 edgecolor=SURFACE, linewidth=1.0, zorder=2,
@@ -446,8 +455,9 @@ def figure_tornado(summary, metric, scale_name, out_base, formats, dpi):
                 ax.barh([yi], [rows['span_pct'].to_numpy()[yi]], height=0.66,
                         color='none', edgecolor=BLUE_MID, hatch='///',
                         linewidth=0.0, zorder=3)
-        noise = float(rows['noise_pct'].iloc[0]) if len(rows) else 0.0
-        ax.axvline(noise, color=ANCHOR, lw=1.1, ls=(0, (4, 3)), zorder=4)
+        if known.any():
+            ax.axvline(float(noise_col[known][0]), color=ANCHOR, lw=1.1,
+                       ls=(0, (4, 3)), zorder=4)
         ax.set_yticks(y)
         ax.set_yticklabels(rows['param'], fontsize=8)
         ax.set_ylim(-0.6, max(len(rows), 4) - 0.4)
