@@ -1,0 +1,34 @@
+{
+  "model": "AdaWaveNet",
+  "seq_len": 96,
+  "pred_len": 1,
+  "label_len": 48,
+  "best_val_loss": 0.22080206141496697,
+  "n_seeds": 3,
+  "best_val_loss_per_seed": [
+    0.213667,
+    0.220942,
+    0.227797
+  ],
+  "best_val_loss_std": 0.007066,
+  "best_params": {
+    "d_model": 64,
+    "d_ff": 64,
+    "e_layers": 1,
+    "n_heads": 8,
+    "lifting_levels": 1,
+    "lifting_kernel_size": 9,
+    "regu_details": 0.02103510986577194,
+    "regu_approx": 0.09794013574900422,
+    "dropout": 0.17962235589281003,
+    "activation": "gelu",
+    "learning_rate": 0.0003415481168488128,
+    "batch_size": 16,
+    "lradj": "type1"
+  },
+  "command": "python -u run.py --task_name long_term_forecast --is_training 1 --model AdaWaveNet --model_id tune_AdaWaveNet_t40 --data custom --root_path ./data/ --data_path EURUSD-RV.csv --features S --target RV --freq d --seq_len 96 --label_len 48 --pred_len 1 --enc_in 1 --dec_in 1 --c_out 1 --train_epochs 30 --patience 7 --num_workers 0 --itr 1 --des optuna --aggregate_mean --log --d_model 64 --d_ff 64 --e_layers 1 --n_heads 8 --lifting_levels 1 --lifting_kernel_size 9 --regu_details 0.02103510986577194 --regu_approx 0.09794013574900422 --dropout 0.17962235589281003 --activation gelu --learning_rate 0.0003415481168488128 --batch_size 16 --lradj type1",
+  "n_trials": 50,
+  "n_complete": 30,
+  "n_pruned": 20,
+  "seconds": 2443.3
+}

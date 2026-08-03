@@ -1,0 +1,25 @@
+{
+  "model": "DLinear",
+  "seq_len": 96,
+  "pred_len": 1,
+  "label_len": 48,
+  "best_val_loss": 0.21909416047856212,
+  "n_seeds": 3,
+  "best_val_loss_per_seed": [
+    0.218229,
+    0.217312,
+    0.221742
+  ],
+  "best_val_loss_std": 0.002338,
+  "best_params": {
+    "moving_avg": 5,
+    "learning_rate": 0.0011423602204915545,
+    "batch_size": 32,
+    "lradj": "type1"
+  },
+  "command": "python -u run.py --task_name long_term_forecast --is_training 1 --model DLinear --model_id tune_DLinear_t21 --data custom --root_path ./data/ --data_path EURUSD-RV.csv --features S --target RV --freq d --seq_len 96 --label_len 48 --pred_len 1 --enc_in 1 --dec_in 1 --c_out 1 --train_epochs 30 --patience 7 --num_workers 0 --itr 1 --des optuna --aggregate_mean --log --moving_avg 5 --learning_rate 0.0011423602204915545 --batch_size 32 --lradj type1",
+  "n_trials": 50,
+  "n_complete": 21,
+  "n_pruned": 29,
+  "seconds": 0.0
+}

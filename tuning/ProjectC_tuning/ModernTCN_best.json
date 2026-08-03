@@ -1,0 +1,39 @@
+{
+  "model": "ModernTCN",
+  "seq_len": 96,
+  "pred_len": 1,
+  "label_len": 48,
+  "best_val_loss": 0.21880142390727997,
+  "n_seeds": 3,
+  "best_val_loss_per_seed": [
+    0.224847,
+    0.21435,
+    0.217207
+  ],
+  "best_val_loss_std": 0.005427,
+  "best_params": {
+    "d_model": 16,
+    "ffn_ratio": 2,
+    "num_blocks": [
+      2
+    ],
+    "large_size": [
+      21
+    ],
+    "small_size": [
+      5
+    ],
+    "patch_size": 4,
+    "patch_stride": 2,
+    "dropout": 0.2817422895577762,
+    "head_dropout": 0.018188574624564677,
+    "learning_rate": 0.0021076131057143925,
+    "batch_size": 128,
+    "lradj": "type1"
+  },
+  "command": "python -u run.py --task_name long_term_forecast --is_training 1 --model ModernTCN --model_id tune_ModernTCN_t10 --data custom --root_path ./data/ --data_path EURUSD-RV.csv --features S --target RV --freq d --seq_len 96 --label_len 48 --pred_len 1 --enc_in 1 --dec_in 1 --c_out 1 --train_epochs 30 --patience 7 --num_workers 0 --itr 1 --des optuna --aggregate_mean --log --d_model 16 --ffn_ratio 2 --num_blocks 2 --large_size 21 --small_size 5 --patch_size 4 --patch_stride 2 --dropout 0.2817422895577762 --head_dropout 0.018188574624564677 --learning_rate 0.0021076131057143925 --batch_size 128 --lradj type1",
+  "n_trials": 50,
+  "n_complete": 33,
+  "n_pruned": 16,
+  "seconds": 579.3
+}

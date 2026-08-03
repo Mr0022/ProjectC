@@ -1,0 +1,28 @@
+{
+  "model": "TSLANet",
+  "seq_len": 96,
+  "pred_len": 1,
+  "label_len": 48,
+  "best_val_loss": 0.21859568978349367,
+  "n_seeds": 3,
+  "best_val_loss_per_seed": [
+    0.219501,
+    0.223429,
+    0.212857
+  ],
+  "best_val_loss_std": 0.005344,
+  "best_params": {
+    "d_model": 32,
+    "e_layers": 1,
+    "patch_size": 8,
+    "dropout": 0.10853449718663048,
+    "learning_rate": 0.0001084010359982145,
+    "batch_size": 64,
+    "lradj": "cosine"
+  },
+  "command": "python -u run.py --task_name long_term_forecast --is_training 1 --model TSLANet --model_id tune_TSLANet_t30 --data custom --root_path ./data/ --data_path EURUSD-RV.csv --features S --target RV --freq d --seq_len 96 --label_len 48 --pred_len 1 --enc_in 1 --dec_in 1 --c_out 1 --train_epochs 30 --patience 7 --num_workers 0 --itr 1 --des optuna --aggregate_mean --log --d_model 32 --e_layers 1 --patch_size 8 --dropout 0.10853449718663048 --learning_rate 0.0001084010359982145 --batch_size 64 --lradj cosine",
+  "n_trials": 50,
+  "n_complete": 47,
+  "n_pruned": 3,
+  "seconds": 0.0
+}

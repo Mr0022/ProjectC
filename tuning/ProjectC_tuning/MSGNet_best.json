@@ -1,0 +1,35 @@
+{
+  "model": "MSGNet",
+  "seq_len": 96,
+  "pred_len": 1,
+  "label_len": 48,
+  "best_val_loss": 0.2175898707161347,
+  "n_seeds": 3,
+  "best_val_loss_per_seed": [
+    0.213252,
+    0.221372,
+    0.218146
+  ],
+  "best_val_loss_std": 0.004088,
+  "best_params": {
+    "d_model": 16,
+    "d_ff": 64,
+    "e_layers": 1,
+    "n_heads": 4,
+    "top_k": 2,
+    "node_dim": 5,
+    "gcn_depth": 1,
+    "propalpha": 0.11327999551092663,
+    "conv_channel": 16,
+    "skip_channel": 8,
+    "dropout": 0.22396053699525778,
+    "learning_rate": 0.00033624509680489867,
+    "batch_size": 64,
+    "lradj": "type1"
+  },
+  "command": "python -u run.py --task_name long_term_forecast --is_training 1 --model MSGNet --model_id tune_MSGNet_t36 --data custom --root_path ./data/ --data_path EURUSD-RV.csv --features S --target RV --freq d --seq_len 96 --label_len 48 --pred_len 1 --enc_in 1 --dec_in 1 --c_out 1 --train_epochs 30 --patience 7 --num_workers 0 --itr 1 --des optuna --aggregate_mean --log --d_model 16 --d_ff 64 --e_layers 1 --n_heads 4 --top_k 2 --node_dim 5 --gcn_depth 1 --propalpha 0.11327999551092663 --conv_channel 16 --skip_channel 8 --dropout 0.22396053699525778 --learning_rate 0.00033624509680489867 --batch_size 64 --lradj type1",
+  "n_trials": 50,
+  "n_complete": 48,
+  "n_pruned": 2,
+  "seconds": 4626.9
+}
