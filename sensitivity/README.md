@@ -9,6 +9,7 @@ figures and tables a paper needs.
 
 ```bash
 python sensitivity/ofat_sensitivity.py --dry_run          # the plan and every command
+python sensitivity/ofat_sensitivity.py --validate         # build every point, train none
 python sensitivity/ofat_sensitivity.py                    # every model with an anchor
 python sensitivity/ofat_sensitivity.py --models ModernTCN # one model
 python sensitivity/ofat_plots.py                          # figures + summary tables
@@ -168,6 +169,11 @@ DLinear/FITS are minutes, PatchTST/TSLANet/iTransformer/ModernTCN/AdaWaveNet/
 TimeMixer are a few hours each, MSGNet the better part of a day. Plan on more
 than one session.
 
+* **Check the plan before committing a session.** `--validate` builds every
+  planned configuration through run.py's own parser and pushes one batch
+  through it on CPU — about a minute for the whole plan — so a corner the
+  architecture rejects surfaces before the sweep starts rather than at hour
+  six. All 243 points of the current plan build and run.
 * **Resumable.** Every completed point is appended to the CSV, and any
   (model, knob, value) already there is skipped. Re-running the same command
   after a disconnect continues where it stopped.
