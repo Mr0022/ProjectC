@@ -1,0 +1,30 @@
+{
+  "model": "TimesNet",
+  "seq_len": 96,
+  "pred_len": 1,
+  "label_len": 48,
+  "best_val_loss": 0.21569926524534822,
+  "n_seeds": 3,
+  "best_val_loss_per_seed": [
+    0.22361,
+    0.209428,
+    0.21406
+  ],
+  "best_val_loss_std": 0.007232,
+  "best_params": {
+    "d_model": 32,
+    "d_ff": 128,
+    "e_layers": 1,
+    "top_k": 2,
+    "num_kernels": 4,
+    "dropout": 0.13905624736596597,
+    "learning_rate": 0.038659265819550995,
+    "batch_size": 32,
+    "lradj": "type1"
+  },
+  "command": "python -u run.py --task_name long_term_forecast --is_training 1 --model TimesNet --model_id tune_TimesNet_t39 --data custom --root_path ./data/ --data_path EURUSD-RV.csv --features S --target RV --freq d --seq_len 96 --label_len 48 --pred_len 1 --enc_in 1 --dec_in 1 --c_out 1 --train_epochs 30 --patience 7 --num_workers 0 --itr 1 --des optuna --aggregate_mean --log --d_model 32 --d_ff 128 --e_layers 1 --top_k 2 --num_kernels 4 --dropout 0.13905624736596597 --learning_rate 0.038659265819550995 --batch_size 32 --lradj type1",
+  "n_trials": 51,
+  "n_complete": 37,
+  "n_pruned": 13,
+  "seconds": 8520.2
+}
