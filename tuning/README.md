@@ -43,16 +43,33 @@ numbers are comparable across models *and* against `HAR-RV_RUN.PY --log`.
 Splits are chronological and fixed by the loader: train ≤ 2022, validation
 2023–2024 (519 windows), test 2025+ (402 windows).
 
-## 2. Shared across all eleven
+## 2. The optimisation block
 
-Identical for all eleven — no model gets a range another one lacks, so the
-resulting table compares architectures rather than search effort.
+Searched by all eleven. The defaults below are the union range of the whole
+family — no model gets a range another one lacks, so the resulting table
+compares architectures rather than search effort.
 
-| Parameter | Range | Why |
+| Parameter | Default range | Why |
 |---|---|---|
 | `learning_rate` | log-uniform `1e-4 … 5e-2` | the UNION of what the family needs. The top of the range exists for DLinear/FITS (a few hundred parameters, much larger steps); the deep models learn within a few trials that it diverges and TPE stops proposing it |
 | `batch_size` | {16, 32, 64, 128} | capped at 128: the train/val loaders use `drop_last=True` and validation holds only 519 windows |
 | `lradj` | {`type1`, `type3`, `cosine`} | not cosmetic — `type1` *halves* the LR every epoch (≈8 useful epochs whatever the budget), `type3` holds 3 epochs then decays 0.9×, `cosine` anneals over the full budget. Strongly coupled to `learning_rate`, so searched jointly |
+
+### Where the OFAT sweep overrode them
+
+Five models now pass their own optimiser bounds. These are not preferences —
+they are what the `sensitivity/` one-factor-at-a-time curves measured around
+each tuned optimum, so holding those models to a range their own curves rule
+out would waste trials rather than enforce fairness. Everything not narrowed
+by evidence stays shared, and **`lradj` is never narrowed for anyone.**
+
+| Model | Override | What the curve showed |
+|---|---|---|
+| DLinear | `learning_rate` `1e-3 … 7e-2` | optimum sat at the top of the old range and had not turned; nothing under `1e-3` was competitive |
+| AdaWaveNet | `learning_rate` `1e-3 … 7e-2` | the lifting filters barely move below `1e-3` — the learned wavelet stays near its initialisation and the model degenerates into an encoder over a fixed basis |
+| MSGNet | `learning_rate` `1e-3 … 1e-2`, `batch_size` {16, 32, 64} | clear interior LR optimum, both ends worse; 128 also discards the most data under `drop_last` on a 519-window split |
+| ModernTCN | `learning_rate` `1e-3 … 1e-2` | same interior optimum |
+| iTransformer | `batch_size` {32, 64, 128} | 16 was the worst point by a clear margin — very noisy gradient for a single-token encoder, and the slowest to train |
 
 `d_ff` is always sampled as a **multiple** of `d_model` (`d_ff_mult ∈ {1,2,4}`)
 rather than independently — otherwise a large part of the grid is spent on
@@ -66,10 +83,20 @@ Only knobs each model actually reads are included. Everything below maps to a
 ### 1. DLinear — 1 architectural knob
 | Parameter | Range | Note |
 |---|---|---|
-| `moving_avg` | {5, 13, 25, 49} | trend/seasonal split. **Must be odd** — the block pads `(k-1)//2` per side, an even kernel returns `L-1` and the residual fails to broadcast. Values ≈ week / half-month / month / quarter |
+| `moving_avg` | {13, 25, 49, 73, 97} | trend/seasonal split. **Must be odd** — the block pads `(k-1)//2` per side, an even kernel returns `L-1` and the residual fails to broadcast. Values ≈ half-month / month / quarter / third-year / whole look-back |
+| `learning_rate` | log-uniform `1e-3 … 7e-2` | narrowed (§2) |
 
 No `d_model`, no `dropout`: DLinear reads neither, and `individual` is a
 constructor argument it never takes from the config.
+
+**Sweep-driven change.** The OFAT curve fell monotonically across the old
+`{5, 13, 25, 49}` grid — 5 the worst point, 49 the best, with no sign of having
+turned — so the short end is dropped and the grid extended *past* a quarter to
+find where it does. **97 is the ceiling, not an arbitrary stop:** the kernel is
+applied with `(k−1)//2` replicated samples per side, so at `k = 97 = seq_len+1`
+every output already averages the whole 96-step window; beyond that only more
+copies of the two endpoints are added and the trend branch stops responding to
+the interior at all.
 
 ### 2. PatchTST
 | Parameter | Range |
@@ -97,6 +124,7 @@ excluded — it only parameterises `ProbAttention`, and PatchTST uses
 | `e_layers` | {1, 2, 3} |
 | `dropout` | 0.0 – 0.3 |
 | `activation` | {gelu, relu} |
+| `batch_size` | {32, 64, 128} — narrowed (§2) |
 
 ⚠️ **Univariate caveat.** iTransformer's tokens *are* the variates, so with
 `enc_in = 1` the encoder holds one token and self-attention is a no-op up to
@@ -116,7 +144,7 @@ hence the widest `d_model` range of the group. `n_heads` will look inert here.
 ### 5. MSGNet
 | Parameter | Range |
 |---|---|
-| `d_model` | {16, 32, 64} |
+| `d_model` | {32, 64} — narrowed |
 | `d_ff_mult` | {1, 2, 4} |
 | `e_layers` | {1, 2} |
 | `n_heads` | {2, 4, 8} |
@@ -125,8 +153,9 @@ hence the widest `d_model` range of the group. `n_heads` will look inert here.
 | `gcn_depth` | {1, 2, 3} |
 | `propalpha` | 0.05 – 0.5 |
 | `conv_channel` | {8, 16, 32} |
-| `skip_channel` | {8, 16, 32} |
-| `dropout` | 0.0 – 0.3 |
+| `skip_channel` | {16, 32, 64} — narrowed |
+| `dropout` | 0.0 – **0.2** — narrowed |
+| `learning_rate` / `batch_size` | `1e-3 … 1e-2` / {16, 32, 64} — narrowed (§2) |
 
 ⚠️ The graph half (`node_dim`, `propalpha`, and to a degree `gcn_depth`) builds
 an adjacency over `c_out` = **1** node, whose softmax is identically 1 — it
@@ -134,6 +163,16 @@ carries no information on a univariate series. `gcn_depth` and the channel
 widths still size the `mixprop` MLP, so they stay in the space with small
 ranges and no expectation of a large effect. The scale half (`top_k`,
 `d_model`, `e_layers`) is what works here.
+
+**Sweep-driven changes.** `d_model` drops 16 — it was the smallest width
+offered and the curve was still improving at 64, so the bottom only cost
+trials. 128 is deliberately *not* added: MSGNet is already the second-heaviest
+model here against ~2.7k training windows. `skip_channel` shifts up one notch
+because it was the one graph-side width whose curve was not flat — it sizes the
+skip projection, which survives a single-node graph, unlike `node_dim`.
+`dropout` stops at 0.2: above that the curve turned up, the model not being
+large enough relative to the sample for heavy regularisation to pay for the
+signal it removes.
 
 ### 6. TimeMixer
 | Parameter | Range |
@@ -169,13 +208,21 @@ window 4 → 96, 24, 6        (1–2 layers; 64 ∤ 96)
 ### 7. FITS — 1 architectural knob
 | Parameter | Range | Note |
 |---|---|---|
-| `cut_freq` | int 3 – 49 | retained rFFT bins of the 96-step window; 49 = `96/2+1` is the hard ceiling (the model clamps beyond it) |
+| `cut_freq` | int **12 – 48** | retained rFFT bins of the 96-step window; 49 = `96/2+1` is the hard ceiling (the model clamps beyond it) |
 
-Bin `b` ↔ period `96/b` days: `cut_freq 5` keeps everything slower than ~19
-days, `24` everything slower than 4 days, `49` keeps all of it. Since the model
-*is* `Linear(cut_freq → cut_freq·97/96)` in complex space, `cut_freq` is both
-the bandwidth and the parameter count — hence a dense integer range rather
-than a coarse grid.
+Bin `b` ↔ period `96/b` days: `cut_freq 12` keeps everything slower than 8
+days, `24` everything slower than 4 days, `48` all but the Nyquist bin. Since
+the model *is* `Linear(cut_freq → cut_freq·97/96)` in complex space, `cut_freq`
+is both the bandwidth and the parameter count — hence a dense integer range
+rather than a coarse grid.
+
+**Sweep-driven change** (was `3 – 49`). Below ~12 the curve rose sharply:
+keeping fewer than a dozen bins throws away everything faster than a fortnight,
+and on realized variance that is where the predictable short-horizon
+persistence lives. The top is 48 rather than 49 because bin 49 is Nyquist — the
+alternating-sign component of a daily series, noise on this data, and the one
+bin the sweep showed to be free to drop. The learning rate keeps the full union
+range: even at `cut_freq 48` this is a few thousand parameters.
 
 ### 8. WFTNet
 | Parameter | Range | Note |
@@ -208,9 +255,11 @@ jointly dominate the parameter count.
 | `num_blocks` | {1, 2, 3} | depth *within* the single stage |
 | `large_size` | {13, 21, 31, 51} | large depth-wise kernel — the point of the model |
 | `small_size` | {3, 5, 7} | re-param kernel |
-| `patch_stride` | {2, 4, 8, 16} | |
+| `patch_stride` | {4, 8, 16} — narrowed | |
 | `patch_size` | `patch_stride × {1, 2}` | |
-| `dropout`, `head_dropout` | 0.0 – 0.3 each | |
+| `dropout` | **0.2 – 0.6** — narrowed *upward* | |
+| `head_dropout` | 0.0 – 0.3 | unchanged, deliberately |
+| `learning_rate` | log-uniform `1e-3 … 1e-2` | narrowed (§2) |
 
 Three constraints, all handled by clamping:
 * `patch_stride` must divide 96 — the head is sized `d_model × (96/stride)`
@@ -219,11 +268,25 @@ Three constraints, all handled by clamping:
   `[B,M,D,N]` reshape breaks) and `small_size ≤ large_size` (asserted by
   `ReparamLargeKernelConv`).
 * `large_size` is clipped to `2 × patch_count`: a 51-tap kernel over the 6
-  patches that `stride 16` produces is 90 % padding. Full range at `stride 2`.
+  patches that `stride 16` produces is 90 % padding.
 
 `num_blocks` stays one element long: with `use_multi_scale` at its default the
 head is built for the pre-downsampling patch count, so a second stage would
 halve the feature axis and mismatch it.
+
+**Sweep-driven changes.** `patch_stride` drops 2: 48 patches gave the largest
+flatten head in the whole file (`d_model × 48` weights against ~2.7k training
+windows) and the worst curve with it. One knock-on — the largest reachable
+patch count is now 24, so the clamp caps kernels at `2×24−1 = 47` and the `51`
+choice becomes a plateau on top of 47 rather than a distinct configuration. It
+stays in the list because the clamp, not the list, defines the reachable set,
+and a wider look-back would make it live again without another edit.
+
+`dropout` is the one range in this file that moved **away** from zero: the
+curve was still falling at the old 0.3 ceiling. ModernTCN is convolutional and
+parameter-dense relative to the sample, and heavy dropout is what buys that
+back. `head_dropout` is *not* moved — it sits on the final projection, its
+curve was flat, and stacking 0.6 on both would starve the head.
 
 ### 11. AdaWaveNet
 | Parameter | Range | Note |
@@ -238,9 +301,16 @@ halve the feature axis and mismatch it.
 | `regu_approx` | log 1e-3 – 1e-1 | penalises approximation-branch drift; together they stop the learned wavelet collapsing to an arbitrary invertible map. Log scale because the effect is multiplicative |
 | `dropout` | 0.0 – 0.3 | |
 | `activation` | {gelu, relu} | |
+| `learning_rate` | log-uniform `1e-3 … 7e-2` | narrowed (§2) — the widest range in the file, and the only deep model to get one |
 
 `n_clusters` is excluded — the model clamps it to `min(n_clusters, enc_in) = 1`.
 `sr_ratio` (super-resolution only) and `factor` (ProbAttention only) likewise.
+
+**Sweep-driven change.** The lifting scheme is trained jointly with the encoder
+under the two regularisers above, and the curve showed it needs a large step to
+move the wavelet filters at all: below `1e-3` the learned transform stays near
+its initialisation and the model degenerates into an encoder over a fixed
+basis. The ceiling goes above the old `5e-2` because the curve had not turned.
 
 ## 4. Trial budget
 
@@ -255,19 +325,22 @@ indicative ranking.
 
 | Model | Discrete grid | Continuous | Trials |
 |---|---|---|---|
-| DLinear | 48 | lr | 50 |
+| DLinear | 60 *(was 48)* | lr | 50 |
 | TSLANet | 432 | lr, dropout | 50 |
-| FITS | 564 | lr | 50 |
-| iTransformer | 2,592 | lr, dropout | 50 |
+| FITS | 444 *(was 564)* | lr | 50 |
+| iTransformer | 1,944 *(was 2,592)* | lr, dropout | 50 |
 | TimesNet | 2,916 | lr, dropout | 50 |
 | WFTNet | 7,776 | lr, dropout, period_coeff | 50 |
 | PatchTST | 15,552 | lr, dropout | 50 |
 | AdaWaveNet | 15,552 | lr, dropout, regu_details, regu_approx | 50 |
-| ModernTCN | 31,104 | lr, dropout, head_dropout | 50 |
-| MSGNet | 157,464 | lr, dropout, propalpha | 50 |
+| ModernTCN | 23,328 *(was 31,104)* | lr, dropout, head_dropout | 50 |
+| MSGNet | 78,732 *(was 157,464)* | lr, dropout, propalpha | 50 |
 | TimeMixer | 209,952 (139,968 after the divisibility clamp) | lr, dropout | 50 |
 
-Grid sizes include the shared `batch_size` × `lradj` factor of 12. The coverage
+Grid sizes include the `batch_size` × `lradj` factor, which is 12 everywhere
+except MSGNet and iTransformer — the two whose `batch_size` the sweep narrowed
+to three choices, so 9. DLinear is the one model whose grid grew, its
+`moving_avg` list having been extended past a quarter. The coverage
 50 trials buys is therefore very uneven — near-exhaustive for DLinear, a thin
 sample for MSGNet and TimeMixer. That is the price of an equal protocol, and
 it is the right price to pay for a comparison; the alternative biases the

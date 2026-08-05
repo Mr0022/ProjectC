@@ -25,6 +25,22 @@ Three rules keep the spaces honest:
    drawn from its full range and then clipped to what the architecture allows.
    Clamping costs a plateau in the response surface; rejection would cost
    whole trials.
+4. A range the OFAT sweep has already settled is NARROWED to the region its
+   curves single out. sensitivity/ moves one knob at a time around the tuned
+   optimum; where a curve showed an arm of a range to be flat, clearly worse,
+   or simply never worth a trial, that arm is dropped here so the next study
+   spends its budget on the part that actually moves the validation loss. Six
+   models carry such a narrowing (DLinear, iTransformer, MSGNet, FITS,
+   ModernTCN, AdaWaveNet); the other five keep the original ranges.
+
+Point 4 is the one place where the spaces are deliberately NOT identical
+across models. The first round gave every model the same optimiser ranges so
+that the benchmark table compared architectures rather than search effort, and
+that is still the default -- `_optimisation` keeps the union range unless a
+model passes its own bounds. What changed is that the sweep has now MEASURED
+where each of those six lives, so holding them to a range their own curves
+rule out would no longer be fairness, only wasted trials. Anything not
+narrowed by evidence stays shared.
 
 The dataset these ranges are calibrated for is the shipped EUR/USD realized
 variance series: ~3.8k daily rows, univariate (features S -> enc_in = 1), of
@@ -67,34 +83,50 @@ MODELS = (
 # ---------------------------------------------------------------------------
 # Shared blocks
 # ---------------------------------------------------------------------------
-def _optimisation(trial):
-    """Settings every model shares -- IDENTICAL for all eleven.
+def _optimisation(trial, learning_rate=(1e-4, 5e-2), batch_sizes=(16, 32, 64, 128)):
+    """The three optimiser knobs, shared by default and overridden by evidence.
 
-    Every model gets the same optimiser budget, so a benchmark table compares
-    architectures rather than how generously each one was tuned. That means
-    the learning-rate range is the UNION of what the family needs rather than
-    a per-model choice: 1e-4 to 5e-2, log-uniform. The upper end exists for
-    DLinear and FITS, which have a few hundred parameters and want a far
-    larger step than a transformer; the deep models will simply learn that the
-    top of the range diverges and TPE will stop proposing it, at the cost of a
-    handful of early trials. Restricting them instead would hand the linear
-    models a range their competitors never see, which is exactly the asymmetry
-    an equal protocol is meant to remove.
+    THE DEFAULTS are the union range of the whole family: learning_rate
+    log-uniform on 1e-4 to 5e-2, batch_size in {16, 32, 64, 128}. The top of
+    the learning-rate range exists for DLinear and FITS, which have a few
+    hundred parameters and want a far larger step than a transformer; a model
+    that has not been swept keeps it, because the deep models simply learn
+    within a few trials that the top diverges and TPE stops proposing it. That
+    costs a handful of early trials and avoids handing the linear models a
+    range their competitors never see.
 
-    batch_size stops at 128 on purpose: the train/val loaders are built with
-    drop_last=True, and the validation split only holds a few hundred windows,
-    so a larger batch would start discarding a visible slice of the very
-    number the study is minimising.
+    THE OVERRIDES are what the OFAT sweep found (see rule 4 in the module
+    docstring). Passing bounds here narrows the search for one model only:
 
-    lradj is a real knob here rather than a formality. 'type1' HALVES the
+        DLinear, AdaWaveNet   lr 1e-3 to 7e-2   the loss keeps falling well
+                                                above the old 5e-2 ceiling and
+                                                nothing below 1e-3 was ever
+                                                competitive
+        MSGNet, ModernTCN     lr 1e-3 to 1e-2   a clear interior optimum; both
+                                                ends of the union range were
+                                                worse
+        MSGNet                batch 16-64       128 dropped: with drop_last on
+                                                a 519-window validation split
+                                                it also discards the most data
+        iTransformer          batch 32-128      16 dropped: noisiest and
+                                                slowest end of its curve
+
+    batch_size never goes above 128 whatever the override: the train/val
+    loaders are built with drop_last=True and the validation split holds only
+    a few hundred windows, so a larger batch discards a visible slice of the
+    very number the study is minimising.
+
+    lradj is a real knob rather than a formality, and is NOT narrowed for
+    anyone -- it stays a three-way choice everywhere. 'type1' HALVES the
     learning rate every epoch, so it effectively caps training at ~8 useful
     epochs whatever --train_epochs says; 'type3' holds the rate for 3 epochs
     then decays by 0.9; 'cosine' anneals over the full budget. Which one wins
-    interacts strongly with the learning rate, so they are searched together.
+    interacts strongly with the learning rate -- a narrowed lr range shifts
+    which schedule looks best -- so they are searched together.
     """
     return {
-        'learning_rate': trial.suggest_float('learning_rate', 1e-4, 5e-2, log=True),
-        'batch_size': trial.suggest_categorical('batch_size', [16, 32, 64, 128]),
+        'learning_rate': trial.suggest_float('learning_rate', *learning_rate, log=True),
+        'batch_size': trial.suggest_categorical('batch_size', list(batch_sizes)),
         'lradj': trial.suggest_categorical('lradj', ['type1', 'type3', 'cosine']),
     }
 
@@ -134,16 +166,30 @@ def dlinear(trial):
     length only for odd k -- an even kernel returns L-1 samples and the
     `x - moving_mean` residual then fails to broadcast.
 
-    The values map to trading-time horizons: 5 = one week, 13 ~ half a month,
-    25 ~ one month (the library default), 49 ~ one quarter. On realized
-    variance the choice decides how much of the slow volatility level is
-    handed to the trend branch.
+    The values map to trading-time horizons: 13 ~ half a month, 25 ~ one month
+    (the library default), 49 ~ one quarter, 73 ~ a third of a year, 97 ~ the
+    whole look-back. On realized variance the choice decides how much of the
+    slow volatility level is handed to the trend branch, and the OFAT curve
+    fell monotonically across the old grid: 5 was the worst point and 49 the
+    best, with no sign of having turned. So the short end is dropped and the
+    grid is extended PAST 49 to find where it does.
+
+    97 is the sensible ceiling, not an arbitrary stop. The kernel is applied
+    with (k-1)//2 replicated samples at each end, so at k = 97 = seq_len + 1
+    every output already averages the entire 96-step window; a longer kernel
+    only adds more copies of the two endpoints and the trend branch stops
+    responding to the interior of the window at all.
 
     d_model/dropout are absent because DLinear reads neither.
+
+    The learning rate is narrowed to 1e-3 - 7e-2 (see _optimisation): the
+    sweep put DLinear's optimum at the top of the old range, which is what a
+    few-hundred-parameter linear model should want, and found everything below
+    1e-3 flat and slow.
     """
     return {
-        'moving_avg': trial.suggest_categorical('moving_avg', [5, 13, 25, 49]),
-        **_optimisation(trial),
+        'moving_avg': trial.suggest_categorical('moving_avg', [13, 25, 49, 73, 97]),
+        **_optimisation(trial, learning_rate=(1e-3, 7e-2)),
     }
 
 
@@ -194,6 +240,11 @@ def itransformer(trial):
     embedding and the FFN. n_heads is kept in the space only because it still
     reshapes those projections; do not expect it to matter here. On a
     multivariate run this is the model whose behaviour changes most.
+
+    batch_size is narrowed to 32-128: the sweep made 16 the worst point of the
+    curve by a clear margin. A single-token encoder over an MLP-sized problem
+    gets a very noisy gradient from 16 windows, and it is also the slowest
+    setting to train, so it costs twice over.
     """
     d_model = trial.suggest_categorical('d_model', [32, 64, 128, 256])
     return {
@@ -203,7 +254,7 @@ def itransformer(trial):
         'e_layers': trial.suggest_categorical('e_layers', [1, 2, 3]),
         'dropout': trial.suggest_float('dropout', 0.0, 0.3),
         'activation': trial.suggest_categorical('activation', ['gelu', 'relu']),
-        **_optimisation(trial),
+        **_optimisation(trial, batch_sizes=(32, 64, 128)),
     }
 
 
@@ -252,8 +303,25 @@ def msgnet(trial):
     the interesting half.
 
     e_layers stops at 2: each layer runs the whole multi-scale + graph stack.
+
+    Four knobs move after the sweep, and they move in different directions:
+
+    * d_model drops 16. It was the smallest width offered and the curve was
+      still improving at 64, so the bottom of the range was only costing
+      trials -- {32, 64} is where the model lives. 128 is deliberately NOT
+      added: MSGNet is already the second-heaviest model in the file at
+      ~157k grid points of cost, and the training set is ~2.7k windows.
+    * skip_channel shifts UP one notch to {16, 32, 64}, the one graph-side
+      width whose curve was not flat -- it sizes the skip projection that
+      survives even with a single node, so unlike node_dim it does real work
+      here.
+    * dropout narrows to 0.0-0.2. Above ~0.2 the curve turned up: at this
+      width the model is not large enough relative to the sample for heavy
+      regularisation to pay for the signal it removes.
+    * the learning rate narrows to 1e-3 - 1e-2 and batch_size to {16, 32, 64}
+      (see _optimisation).
     """
-    d_model = trial.suggest_categorical('d_model', [16, 32, 64])
+    d_model = trial.suggest_categorical('d_model', [32, 64])
     return {
         'd_model': d_model,
         'd_ff': _d_ff(trial, d_model),
@@ -264,9 +332,9 @@ def msgnet(trial):
         'gcn_depth': trial.suggest_categorical('gcn_depth', [1, 2, 3]),
         'propalpha': trial.suggest_float('propalpha', 0.05, 0.5),
         'conv_channel': trial.suggest_categorical('conv_channel', [8, 16, 32]),
-        'skip_channel': trial.suggest_categorical('skip_channel', [8, 16, 32]),
-        'dropout': trial.suggest_float('dropout', 0.0, 0.3),
-        **_optimisation(trial),
+        'skip_channel': trial.suggest_categorical('skip_channel', [16, 32, 64]),
+        'dropout': trial.suggest_float('dropout', 0.0, 0.2),
+        **_optimisation(trial, learning_rate=(1e-3, 1e-2), batch_sizes=(16, 32, 64)),
     }
 
 
@@ -341,16 +409,25 @@ def fits(trial):
     cut_freq is the number of retained rFFT bins of the 96-step window. The
     spectrum has 96//2 + 1 = 49 bins, which is the hard upper bound (the model
     clamps anything larger). Bin b corresponds to a period of 96/b days, so
-    cut_freq = 5 keeps everything slower than ~19 days, cut_freq = 24 keeps
-    everything slower than 4 days, and 49 keeps the lot. Since the whole model
-    is Linear(cut_freq -> cut_freq * (97/96)) in complex space, cut_freq is
-    simultaneously the bandwidth AND the parameter count.
+    cut_freq = 12 keeps everything slower than 8 days, cut_freq = 24 keeps
+    everything slower than 4 days, and 48 keeps all but the Nyquist bin. Since
+    the whole model is Linear(cut_freq -> cut_freq * (97/96)) in complex space,
+    cut_freq is simultaneously the bandwidth AND the parameter count.
 
-    The wide learning-rate ceiling matters here: at cut_freq = 5 the model has
-    a few hundred parameters and trains far faster than any deep baseline.
+    The range is narrowed to 12-48 from the sweep. Below ~12 the curve rose
+    sharply: keeping fewer than a dozen bins throws away everything faster
+    than a fortnight, and on realized variance that is where the predictable
+    short-horizon persistence lives. The top is 48 rather than 49 because the
+    49th bin is Nyquist -- the alternating-sign component of a daily series,
+    which on this data is noise, and it is the one bin whose removal the sweep
+    showed to be free.
+
+    The wide learning-rate ceiling matters here: even at cut_freq = 48 the
+    model has a few thousand parameters and trains far faster than any deep
+    baseline, so it keeps the full union range.
     """
     return {
-        'cut_freq': trial.suggest_int('cut_freq', 3, 49),
+        'cut_freq': trial.suggest_int('cut_freq', 12, 48),
         **_optimisation(trial),
     }
 
@@ -432,15 +509,35 @@ def moderntcn(trial):
       ReparamLargeKernelConv).
     * large_size is clipped to twice the patch count. A 51-tap kernel over the
       6 patches produced by stride 16 is 90 % padding -- parameters spent on
-      nothing. With stride 2 (48 patches) the full range is available.
+      nothing.
 
     num_blocks stays a single-element list: with use_multi_scale left at its
     default the head is built for the pre-downsampling patch count, so a
     second stage would halve the feature axis and mismatch it. Depth is
     therefore searched WITHIN the one stage.
+
+    Three changes after the sweep:
+
+    * patch_stride drops 2. Forty-eight patches at stride 2 gave the largest
+      flatten head of the whole grid and the worst curve with it -- the head
+      alone then holds d_model * 48 weights against ~2.7k training windows.
+      4-16 is the useful part. Note the knock-on: the largest patch count now
+      reachable is 24 (stride 4), so the large_size clamp caps kernels at
+      2*24 - 1 = 47 and the 51 choice is a plateau on top of 47 rather than a
+      distinct configuration. It is left in the list because the clamp, not
+      the list, is what defines the reachable set -- and because a wider
+      look-back would make 51 live again without another edit here.
+    * dropout moves UP to 0.2-0.6, the one place in this file where a range
+      moved away from zero. ModernTCN's curve was still falling at the old
+      0.3 ceiling: the model is convolutional and parameter-dense relative to
+      the sample, and heavy dropout is what buys it back. head_dropout is
+      NOT moved -- it sits on the final projection, its curve was flat, and
+      stacking 0.6 on both would starve the head.
+    * the learning rate narrows to 1e-3 - 1e-2 (see _optimisation), an
+      interior optimum with both ends of the union range clearly worse.
     """
     d_model = trial.suggest_categorical('d_model', [16, 32, 64])
-    patch_stride = trial.suggest_categorical('patch_stride', [2, 4, 8, 16])
+    patch_stride = trial.suggest_categorical('patch_stride', [4, 8, 16])
     patch_size = patch_stride * trial.suggest_categorical('patch_size_mult', [1, 2])
 
     patch_num = FIXED_PROTOCOL['seq_len'] // patch_stride
@@ -456,9 +553,9 @@ def moderntcn(trial):
         'small_size': [small],
         'patch_size': patch_size,
         'patch_stride': patch_stride,
-        'dropout': trial.suggest_float('dropout', 0.0, 0.3),
+        'dropout': trial.suggest_float('dropout', 0.2, 0.6),
         'head_dropout': trial.suggest_float('head_dropout', 0.0, 0.3),
-        **_optimisation(trial),
+        **_optimisation(trial, learning_rate=(1e-3, 1e-2)),
     }
 
 
@@ -487,6 +584,14 @@ def adawavenet(trial):
     n_clusters is absent: the model clamps it to min(n_clusters, enc_in), and
     enc_in = 1 here. sr_ratio and factor are absent too -- the former is read
     only on the super_resolution task, the latter only by ProbAttention.
+
+    The learning rate narrows to 1e-3 - 7e-2, the widest range in the file and
+    the only deep model to get one. The lifting scheme is trained jointly with
+    the encoder under the two regularisers above, and the sweep showed it
+    needs a large step to move the wavelet filters at all -- below 1e-3 the
+    learned transform stays near its initialisation and the model degenerates
+    into an encoder over a fixed basis. The ceiling goes above the old 5e-2
+    because the curve had not turned there.
     """
     d_model = trial.suggest_categorical('d_model', [16, 32, 64])
     return {
@@ -500,7 +605,7 @@ def adawavenet(trial):
         'regu_approx': trial.suggest_float('regu_approx', 1e-3, 1e-1, log=True),
         'dropout': trial.suggest_float('dropout', 0.0, 0.3),
         'activation': trial.suggest_categorical('activation', ['gelu', 'relu']),
-        **_optimisation(trial),
+        **_optimisation(trial, learning_rate=(1e-3, 7e-2)),
     }
 
 

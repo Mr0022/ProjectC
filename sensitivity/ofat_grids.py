@@ -63,16 +63,28 @@ SEQ_LEN = FIXED_PROTOCOL['seq_len']
 # ---------------------------------------------------------------------------
 # Shared value sets
 # ---------------------------------------------------------------------------
-# _optimisation() draws learning_rate log-uniformly on [1e-4, 5e-2]; six points
-# at roughly half a decade apart cover it without spending a fifth of the whole
-# sweep on one knob. batch_size and lradj are the searched categoricals verbatim.
+# _optimisation() draws learning_rate log-uniformly on [1e-4, 5e-2] by default;
+# six points at roughly half a decade apart cover it without spending a fifth of
+# the whole sweep on one knob. batch_size and lradj are the searched
+# categoricals verbatim.
 LEARNING_RATE = [1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2]
 BATCH_SIZE = [16, 32, 64, 128]
 LRADJ = ['type1', 'type3', 'cosine']
 
-# dropout is drawn from U(0.0, 0.3) almost everywhere -- TSLANet is the one
-# exception (U(0.05, 0.3)), and gets its own grid below.
+# Models whose optimiser range the first sweep narrowed carry their own grid,
+# spaced across whatever range search_spaces.py now gives them -- log-spaced,
+# because that is still how the draw is made. _OPTIMISATION below says which
+# model gets which.
+LEARNING_RATE_HIGH = [1e-3, 3e-3, 1e-2, 3e-2, 7e-2]     # DLinear, AdaWaveNet
+LEARNING_RATE_TIGHT = [1e-3, 2e-3, 3e-3, 5e-3, 1e-2]    # MSGNet, ModernTCN
+
+# dropout is drawn from U(0.0, 0.3) almost everywhere. Three models are now
+# exceptions and get their own grids below: TSLANet U(0.05, 0.3), MSGNet
+# U(0.0, 0.2), ModernTCN U(0.2, 0.6) -- the last on `dropout` only, its
+# `head_dropout` still being the shared U(0.0, 0.3).
 DROPOUT = [0.0, 0.1, 0.2, 0.3]
+DROPOUT_LOW = [0.0, 0.05, 0.1, 0.15, 0.2]               # MSGNet
+DROPOUT_HIGH = [0.2, 0.3, 0.4, 0.5, 0.6]                # ModernTCN
 
 N_HEADS = [2, 4, 8]
 D_FF_MULT = (1, 2, 4)
@@ -140,7 +152,10 @@ def _d_ff(anchor):
 # top_k pair resolves to whichever one its winner actually used.
 # ---------------------------------------------------------------------------
 def _dlinear(a):
-    return [('moving_avg', [5, 13, 25, 49])]
+    # The searched grid now starts at 13 and runs past a quarter to 97, one
+    # more than seq_len -- the kernel at which every output already averages
+    # the whole window and longer kernels only replicate the endpoints.
+    return [('moving_avg', [13, 25, 49, 73, 97])]
 
 
 def _patchtst(a):
@@ -183,7 +198,7 @@ def _timesnet(a):
 
 def _msgnet(a):
     return [
-        ('d_model', [16, 32, 64]),
+        ('d_model', [32, 64]),
         ('d_ff', _d_ff(a)),
         ('e_layers', [1, 2]),
         ('n_heads', N_HEADS),
@@ -192,8 +207,8 @@ def _msgnet(a):
         ('gcn_depth', [1, 2, 3]),
         ('propalpha', [0.05, 0.15, 0.3, 0.5]),
         ('conv_channel', [8, 16, 32]),
-        ('skip_channel', [8, 16, 32]),
-        ('dropout', DROPOUT),
+        ('skip_channel', [16, 32, 64]),
+        ('dropout', DROPOUT_LOW),
     ]
 
 
@@ -215,9 +230,11 @@ def _timemixer(a):
 
 
 def _fits(a):
-    # cut_freq was searched as an INTEGER over [3, 49] -- the whole rFFT of a
-    # 96-step window. Six points spanning it, ending on the full spectrum.
-    return [('cut_freq', [3, 6, 12, 24, 36, 49])]
+    # cut_freq is searched as an INTEGER over [12, 48] -- the rFFT of a 96-step
+    # window minus the Nyquist bin and minus the bottom dozen. Evenly spaced by
+    # 6, which is a whole number of bins and so a grid the model can actually
+    # take; a log grid would put four of seven points below 20.
+    return [('cut_freq', [12, 18, 24, 30, 36, 42, 48])]
 
 
 def _wftnet(a):
@@ -251,11 +268,17 @@ def _moderntcn(a):
         ('d_model', [16, 32, 64]),
         ('ffn_ratio', [1, 2, 4]),
         ('num_blocks', [1, 2, 3]),
+        # 51 is still the top of the searched list, but with stride 2 gone the
+        # largest patch count is 24 and the clamp caps kernels at 2*24-1 = 47.
+        # It is kept here for the same reason search_spaces.py keeps it: the
+        # grid mirrors the value SET that was searched, and resolve() applies
+        # the same clamp the study applied, so the panel shows where the
+        # kernel stops growing rather than hiding it.
         ('large_size', [13, 21, 31, 51]),
         ('small_size', [3, 5, 7]),
-        ('patch_stride', [2, 4, 8, 16]),
+        ('patch_stride', [4, 8, 16]),
         ('patch_size', [stride * m for m in (1, 2)]),
-        ('dropout', DROPOUT),
+        ('dropout', DROPOUT_HIGH),
         ('head_dropout', DROPOUT),
     ]
 
@@ -292,9 +315,23 @@ _SPECIFIC = {
 assert set(_SPECIFIC) == set(MODELS)
 
 
-def _shared(a):
-    return [('learning_rate', LEARNING_RATE),
-            ('batch_size', BATCH_SIZE),
+# Per-model optimiser overrides, mirroring the bounds each model passes to
+# search_spaces._optimisation. A model absent from this table sweeps the shared
+# defaults; a key absent from its entry falls back to the shared default for
+# that one knob. lradj is never overridden -- no model narrows it.
+_OPTIMISATION = {
+    'DLinear': {'learning_rate': LEARNING_RATE_HIGH},
+    'AdaWaveNet': {'learning_rate': LEARNING_RATE_HIGH},
+    'MSGNet': {'learning_rate': LEARNING_RATE_TIGHT, 'batch_size': [16, 32, 64]},
+    'ModernTCN': {'learning_rate': LEARNING_RATE_TIGHT},
+    'iTransformer': {'batch_size': [32, 64, 128]},
+}
+
+
+def _shared(model, a):
+    override = _OPTIMISATION.get(model, {})
+    return [('learning_rate', override.get('learning_rate', LEARNING_RATE)),
+            ('batch_size', override.get('batch_size', BATCH_SIZE)),
             ('lradj', LRADJ)]
 
 
@@ -302,10 +339,14 @@ def grids(model, anchor):
     """{flag: [values]} for `model`, anchored at `anchor` (its best_params).
 
     Panel order: the model's own knobs first, then the three optimisation
-    knobs every model shares, so the shared block sits in the same place in
-    every figure. The anchor's own value is folded into each grid -- ascending
-    for numeric knobs, appended for nominal ones -- so no curve has a hole
-    where its centre should be.
+    knobs every model sweeps, so that block sits in the same place in every
+    figure -- even where its RANGE is now per-model (see _OPTIMISATION). The
+    anchor's own value is folded into each grid -- ascending for numeric knobs,
+    appended for nominal ones -- so no curve has a hole where its centre should
+    be. An anchor from a study run under the older, wider ranges therefore
+    still appears on its panel, sitting outside the current grid; that is the
+    intended behaviour, since a curve that skipped its own centre could not be
+    read against the anchor run.
     """
     try:
         specific = _SPECIFIC[model]
@@ -314,7 +355,7 @@ def grids(model, anchor):
                        f"{', '.join(MODELS)}") from None
 
     out = {}
-    for flag, values in specific(anchor) + _shared(anchor):
+    for flag, values in specific(anchor) + _shared(model, anchor):
         if flag not in anchor:
             # A knob this winner never used: TimeMixer's moving_avg when its
             # decomposition is the DFT one, or vice versa. Sweeping it would

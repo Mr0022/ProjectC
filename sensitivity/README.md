@@ -86,7 +86,11 @@ searched ratios:
 | PatchTST `stride` | `{patch_len/2, patch_len}` at the anchor's patch length | `patch_overlap ∈ {half, none}` |
 | ModernTCN `patch_size` | `{1, 2} × anchor patch_stride` | `patch_size_mult ∈ {1,2}` |
 
-### 3.1 Shared by every model
+### 3.1 The optimisation block
+
+Swept by every model, in the same panel position in every figure — but no
+longer over the same range everywhere, because the first round of these very
+sweeps narrowed five of the spaces. The defaults:
 
 | Knob | Grid | Searched range |
 |---|---|---|
@@ -94,8 +98,30 @@ searched ratios:
 | `batch_size` | 16, 32, 64, 128 | the same four |
 | `lradj` | `type1`, `type3`, `cosine` | the same three |
 
-`dropout` (and `head_dropout`) sweep 0.0, 0.1, 0.2, 0.3 — the U(0, 0.3) the
-study drew from; TSLANet's starts at 0.05, as its space does.
+and the overrides, which mirror the bounds each model passes to
+`search_spaces._optimisation` (`_OPTIMISATION` in `ofat_grids.py`):
+
+| Model | Knob | Grid | Searched range |
+|---|---|---|---|
+| DLinear, AdaWaveNet | `learning_rate` | 1e-3, 3e-3, 1e-2, 3e-2, 7e-2 | log-uniform 1e-3 … 7e-2 |
+| MSGNet, ModernTCN | `learning_rate` | 1e-3, 2e-3, 3e-3, 5e-3, 1e-2 | log-uniform 1e-3 … 1e-2 |
+| MSGNet | `batch_size` | 16, 32, 64 | the same three |
+| iTransformer | `batch_size` | 32, 64, 128 | the same three |
+
+`lradj` is never overridden — no model narrows it.
+
+`dropout` sweeps 0.0, 0.1, 0.2, 0.3 — the U(0, 0.3) the study drew from — with
+three exceptions that again follow their spaces: TSLANet starts at 0.05, MSGNet
+stops at 0.2 (0.0, 0.05, 0.1, 0.15, 0.2), and ModernTCN sweeps 0.2, 0.3, 0.4,
+0.5, 0.6, its range having moved *up*. ModernTCN's `head_dropout` keeps the
+shared 0.0 – 0.3, matching the one-sided narrowing in its space.
+
+⚠️ **Anchors predating the narrowing.** §3.2 folds the anchor's own value into
+every grid, so an anchor from a study run under the older, wider ranges still
+appears on its panel while sitting outside the current grid — MSGNet's
+`skip_channel 8`, ModernTCN's `patch_stride 2`. That is intended: a curve that
+skipped its own centre could not be read against the anchor run. Re-tune before
+reading such a panel as a statement about the current space.
 
 ### 3.2 The anchor is always on the grid
 
@@ -104,26 +130,32 @@ through the tuned configuration. A grid point that lands **almost** on the
 anchor — Optuna's 0.00114 beside the grid's 0.001 — is replaced by it rather
 than trained separately: within a fifth of a decade on a log knob, or 5% of the
 range on a linear one, the two configurations are indistinguishable and would
-plot on top of each other. That trims 11 of 254 points.
+plot on top of each other. That trims 10 of 279 points.
 
 ### 3.3 Points per model
 
 | Model | Knobs swept | Points (incl. anchor) | Trainings at `--itr 5` |
 |---|---|---|---|
-| DLinear | 4 | 14 | 70 |
-| FITS | 4 | 16 | 80 |
+| DLinear | 4 | 15 | 75 |
+| FITS | 4 | 17 | 85 |
 | TSLANet | 7 | 21 | 105 |
-| iTransformer | 9 | 25 | 125 |
+| iTransformer | 9 | 24 | 120 |
+| TimesNet | 9 | 26 | 130 |
 | PatchTST | 11 | 28 | 140 |
-| ModernTCN | 12 | 35 | 175 |
-| AdaWaveNet | 13 | 37 | 185 |
-| MSGNet | 14 | 36 | 180 |
 | TimeMixer | 14 | 31 | 155 |
-| **total (9 tuned models)** | | **243** | **1 215** |
+| ModernTCN | 12 | 33 | 165 |
+| AdaWaveNet | 13 | 37 | 185 |
+| MSGNet | 14 | 37 | 185 |
+| **total (10 tuned models)** | | **269** | **1 345** |
+
+Counted against the anchors currently in `tuning/ProjectC_tuning/` and the
+narrowed spaces of §3.1. The narrowing is close to cost-neutral overall —
+`iTransformer` and `ModernTCN` lose a point or two with their dropped
+`batch_size`/`patch_stride` choices, `DLinear` and `FITS` gain a couple from
+the longer `moving_avg` and evenly spaced `cut_freq` grids.
 
 `--dry_run` prints the exact plan and every command without training anything.
-`TimesNet` and `WFTNet` join the table as soon as their `_best.json` files
-exist.
+`WFTNet` joins the table as soon as its `_best.json` file exists.
 
 ## 4. Coupled knobs and clamps
 
@@ -163,7 +195,7 @@ So the same sweep can be read on the criterion the search optimised
 
 ## 6. Cost, resuming, failures
 
-At `--itr 5` and 30 epochs the full sweep is ~1 215 trainings — the same order
+At `--itr 5` and 30 epochs the full sweep is ~1 345 trainings — the same order
 as the tuning study itself (50 trials × 3 seeds per model). On a T4:
 DLinear/FITS are minutes, PatchTST/TSLANet/iTransformer/ModernTCN/AdaWaveNet/
 TimeMixer are a few hours each, MSGNet the better part of a day. Plan on more
@@ -173,7 +205,7 @@ than one session.
   planned configuration through run.py's own parser and pushes one batch
   through it on CPU — about a minute for the whole plan — so a corner the
   architecture rejects surfaces before the sweep starts rather than at hour
-  six. All 243 points of the current plan build and run.
+  six. All 269 points of the current plan build and run.
 * **Resumable.** Every completed point is appended to the CSV, and any
   (model, knob, value) already there is skipped. Re-running the same command
   after a disconnect continues where it stopped.
