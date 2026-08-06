@@ -7,17 +7,29 @@ Based on: Corsi, F. (2009). A simple approximate long-memory model of
 
 Horizons : h = 1  (daily),  h = 5  (weekly),  h = 22  (monthly)
 
-Split logic follows Dataset_Custom (data_loader.py), which splits
-    train 2012-2022  |  val 2023-2024  |  test 2025-end
+Split logic is imported from data_provider/splits.py, the same module the deep
+models split on, so the two families can never drift apart. The two asset
+classes do not share a calendar -- pick one with --asset:
+
+    --asset forex   train 2012-01..2022-12 | val 2023-01..2024-12 | test 2025-01..end
+    --asset crypto  train 2018-06..2024-06 | val 2024-07..2025-06 | test 2025-07..2026-06
 
 HAR-RV is OLS: there are no hyperparameters to tune, so a held-out validation
-set would serve no purpose. The validation years are therefore folded back
-into the estimation sample:
-    Train : start of sample - end of 2024  (year <= 2024)  [= DL train + val]
-    Test  : 2025 onwards                   (year >= 2025)  [= DL test]
+set would serve no purpose. The validation months are therefore folded back
+into the estimation sample, on whichever calendar is in force:
+
+    forex    Train : start of sample - 2024-12   [= DL train + val]
+             Test  : 2025-01 - end of sample     [= DL test]
+    crypto   Train : 2018-06 - 2025-06           [= DL train + val]
+             Test  : 2025-07 - 2026-06           [= DL test]
+
 The TEST window is identical to the deep models', so out-of-sample losses
-remain directly comparable. Note the deep models never fit on 2023-2024;
-they only use it for early stopping / model selection.
+remain directly comparable. Note the deep models never fit on the validation
+months; they only use them for early stopping / model selection.
+
+--asset defaults to forex and is NOT inferred from the filename: running a
+crypto CSV without --asset crypto silently trains on the wrong window, so the
+calendar in force is printed at the top of every run and on every figure.
 
 ------------------------------------------------------------------------------
 USAGE (command line / notebook)
@@ -26,6 +38,7 @@ USAGE (command line / notebook)
     python HAR-RV_RUN.PY --data EURUSD_RV.CSV    # pick a data file
     python HAR-RV_RUN.PY --data path/to/my_rv.csv --outdir results
     python HAR-RV_RUN.PY --log                   # same run on the ln(RV) scale
+    python HAR-RV_RUN.PY --data btcusdt-RV.csv --asset crypto     # crypto calendar
 
 In a Jupyter/Colab cell prefix with '!':
     !python HAR-RV_RUN.PY --data EURUSD_RV.CSV
@@ -232,6 +245,12 @@ from   statsmodels.stats.stattools         import durbin_watson
 from   statsmodels.stats.diagnostic        import acorr_ljungbox, het_breuschpagan
 from   scipy                               import stats
 
+# Split calendars, shared with the deep models (data_provider/data_loader.py).
+# splits.py is deliberately pandas/numpy only, so importing it here does not
+# drag torch or sklearn into a HAR-RV run.
+from   data_provider.splits import (SPLITS, har_bounds, month_mask, fmt_month,
+                                    month_of, next_month, to_ordinal)
+
 
 # ==============================================================================
 # 0.  CONFIGURATION  (defaults; overridable on the command line -- see parse_args)
@@ -245,11 +264,18 @@ OUT_DIR   = "."                    # where figures / CSVs are written (--outdir)
 # the default and the behaviour of every previous version of this script.
 LOG_MODE = False
 
-# Mirrors data_provider/data_loader.py: VAL_END_YEAR = 2024, so the deep
-# models' train (<=2022) and val (2023-2024) years both become HAR training
-# data, and the test window (2025-end) is shared.
-TRAIN_END_YEAR  = 2024
-TEST_START_YEAR = 2025
+# Asset class, i.e. which calendar in data_provider/splits.py to split on.
+# har_bounds() folds that calendar's validation months into HAR's training
+# sample (OLS has nothing to tune) and leaves the test window untouched, so the
+# deep models and HAR-RV are scored on exactly the same out-of-sample rows.
+# Set from --asset; the four bounds below are filled in by resolve_split().
+ASSET = "forex"
+
+# Inclusive (year, month) bounds. None = open on that side.
+TRAIN_START = None
+TRAIN_END   = None
+TEST_START  = None
+TEST_END    = None
 
 # Forecast horizons. 'overlap_lag' = 2*(h-1) is the MA(h-1) floor induced by
 # the overlapping h-day target; 'nw_lag' is the bandwidth actually used and is
@@ -306,9 +332,12 @@ plt.rcParams.update({
 SEP  = "=" * 72
 THIN = "-" * 72
 
-# Populated at load time so printed headers track the actual sample.
-SAMPLE_START_YEAR = None
-SAMPLE_END_YEAR   = None
+# Human-readable split windows, e.g. "2018-06 - 2025-06". Built once in
+# load_base_features() from the requested bounds intersected with what the file
+# actually contains, so every table, figure title and export says the same
+# thing and says it in months -- crypto's windows do not fall on year ends.
+TRAIN_LABEL = ""
+TEST_LABEL  = ""
 
 
 # ==============================================================================
@@ -404,11 +433,31 @@ def parse_args(argv=None):
              "raw-scale run at every horizon. Outputs are written as "
              "har_rv_log_* so they do not overwrite a raw-scale run.")
     p.add_argument(
-        "--train-end-year", type=int, default=TRAIN_END_YEAR, metavar="YEAR",
-        help="Last calendar year (inclusive) of the training sample.")
-    p.add_argument(
-        "--test-start-year", type=int, default=TEST_START_YEAR, metavar="YEAR",
-        help="First calendar year (inclusive) of the test sample.")
+        "--asset", choices=sorted(SPLITS), default=ASSET,
+        help="Which split calendar to use (data_provider/splits.py). 'forex' = "
+             "train ..2022-12 / val 2023-01..2024-12 / test 2025-01.., 'crypto' "
+             "= train 2018-06..2024-06 / val 2024-07..2025-06 / test 2025-07.."
+             "2026-06. HAR-RV folds the validation months into training and "
+             "keeps the test window, so it stays comparable to the deep models "
+             "run with the matching --data. NOT inferred from the filename.")
+    for flag, dest in (("--train-start", "train_start"),
+                       ("--train-end",   "train_end"),
+                       ("--test-start",  "test_start"),
+                       ("--test-end",    "test_end")):
+        p.add_argument(
+            flag, dest=dest, default=None, metavar="YYYY-MM",
+            help=f"Override the {dest.replace('_', ' ')} boundary of --asset "
+                 f"(inclusive); None keeps the --asset boundary. Accepts "
+                 f"YYYY-MM, or a bare YYYY meaning "
+                 f"{'January' if dest.endswith('start') else 'December'} of "
+                 f"that year. 'open' removes the boundary.")
+    # Deprecated year-granularity spellings, kept so older invocations still
+    # run. They cannot express crypto's mid-year boundaries; --train-end /
+    # --test-start supersede them.
+    p.add_argument("--train-end-year", type=int, default=None,
+                   metavar="YEAR", help=argparse.SUPPRESS)
+    p.add_argument("--test-start-year", type=int, default=None,
+                   metavar="YEAR", help=argparse.SUPPRESS)
     p.add_argument(
         "--qlike-floor-frac", type=float, default=QLIKE_FLOOR_FRAC, metavar="FRAC",
         help="Non-positive forecasts are floored at FRAC * mean(training RV) "
@@ -420,6 +469,75 @@ def parse_args(argv=None):
              "residual autocorrelation Ljung-Box detects. 'overlap' = the "
              "pure 2*(h-1) convention, for robustness checks.")
     return p.parse_args(argv)
+
+
+def parse_month(text: str, flag: str, *, is_start: bool):
+    """
+    Parse a boundary written as 'YYYY-MM', 'YYYY' or 'open'.
+
+    A bare year is widened to the whole year in the direction the boundary
+    faces -- January for a start bound, December for an end bound -- so
+    '--train-end 2024' means "through the end of 2024", which is what the
+    retired --train-end-year flag meant. 'open' returns None (no boundary).
+    """
+    text = str(text).strip().lower()
+    if text in ("open", "none"):
+        return None
+    parts = text.split("-")
+    try:
+        if len(parts) == 1:
+            year, month = int(parts[0]), (1 if is_start else 12)
+        elif len(parts) == 2:
+            year, month = int(parts[0]), int(parts[1])
+        else:
+            raise ValueError
+        if not 1 <= month <= 12:
+            raise ValueError
+    except ValueError:
+        raise SystemExit(
+            f"{flag}: expected YYYY-MM, YYYY or 'open', got '{text}'.")
+    return (year, month)
+
+
+def resolve_split(args):
+    """
+    Turn --asset plus any boundary overrides into the four HAR-RV bounds.
+
+    The asset's calendar comes from data_provider/splits.py and is passed
+    through har_bounds(), which folds the deep models' validation months into
+    HAR's training sample and leaves their test window untouched. Overrides are
+    applied on top, so --asset picks a coherent default and the individual
+    flags stay available for robustness checks.
+    """
+    train_start, train_end, test_start, test_end = har_bounds(SPLITS[args.asset])
+
+    # Retired spellings, mapped onto the month-granular ones.
+    if args.train_end_year is not None:
+        train_end = (args.train_end_year, 12)
+    if args.test_start_year is not None:
+        test_start = (args.test_start_year, 1)
+
+    if args.train_start is not None:
+        train_start = parse_month(args.train_start, "--train-start", is_start=True)
+    if args.train_end is not None:
+        train_end = parse_month(args.train_end, "--train-end", is_start=False)
+    if args.test_start is not None:
+        test_start = parse_month(args.test_start, "--test-start", is_start=True)
+    if args.test_end is not None:
+        test_end = parse_month(args.test_end, "--test-end", is_start=False)
+
+    if train_end is None:
+        raise SystemExit("--train-end cannot be open: training needs an end.")
+    if test_start is None:
+        test_start = next_month(train_end)
+    # An overlap would fit and score on the same rows -- the one mistake these
+    # flags make easy, and one that quietly flatters every reported loss.
+    if to_ordinal(test_start) <= to_ordinal(train_end):
+        raise SystemExit(
+            f"Test starts {fmt_month(test_start)} but training runs through "
+            f"{fmt_month(train_end)}: the windows overlap, so the model would "
+            f"be scored on rows it was fitted on.")
+    return train_start, train_end, test_start, test_end
 
 
 def resolve_data_path(path: str) -> str:
@@ -465,6 +583,26 @@ def resolve_data_path(path: str) -> str:
 # ==============================================================================
 # 1.  DATA LOADING & BASE REGRESSOR CONSTRUCTION
 # ==============================================================================
+
+def set_split_labels(index):
+    """
+    Build the printed split windows, e.g. 'Train 2018-06 - 2025-06'.
+
+    The requested bounds are intersected with what the file actually holds, so
+    an open bound reports the real sample edge rather than '?', and a closed
+    bound that reaches past the data (a crypto CSV that stops early) reports
+    where the data really ends. Labels are months throughout: crypto's windows
+    do not fall on year ends, and printing them as years would round the
+    boundary the run was configured with.
+    """
+    global TRAIN_LABEL, TEST_LABEL
+
+    first, last = month_of(index[0]), month_of(index[-1])
+    lo = first if TRAIN_START is None else max(TRAIN_START, first)
+    hi = last if TEST_END is None else min(TEST_END, last)
+    TRAIN_LABEL = f"{fmt_month(lo)} - {fmt_month(TRAIN_END)}"
+    TEST_LABEL  = f"{fmt_month(TEST_START)} - {fmt_month(hi)}"
+
 
 def load_base_features(filepath: str) -> pd.DataFrame:
     """
@@ -532,8 +670,6 @@ def load_base_features(filepath: str) -> pd.DataFrame:
     no look-ahead. Regressors are IDENTICAL across horizons; only the target
     changes.
     """
-    global SAMPLE_START_YEAR, SAMPLE_END_YEAR
-
     if not os.path.isfile(filepath):
         raise FileNotFoundError(
             f"Data file not found: '{filepath}'. Pass a valid path with "
@@ -572,8 +708,7 @@ def load_base_features(filepath: str) -> pd.DataFrame:
         if ln_in is not None:
             print("  Exponentiated once to raw RV (raw mode).")
 
-    SAMPLE_START_YEAR = int(s.index[0].year)
-    SAMPLE_END_YEAR   = int(s.index[-1].year)
+    set_split_labels(s.index)
 
     df = pd.DataFrame({"RV": s, "RV_raw": s_raw})
     if LOG_MODE:
@@ -642,22 +777,42 @@ def build_horizon_target(df_base: pd.DataFrame, h: int) -> pd.DataFrame:
 
 
 # ==============================================================================
-# 3.  YEAR-BASED TRAIN / TEST SPLIT   (mirrors Dataset_Custom)
+# 3.  CALENDAR TRAIN / TEST SPLIT   (bounds shared with the deep models)
 # ==============================================================================
 
-def split_by_year(df: pd.DataFrame,
-                  train_end_year: int  = TRAIN_END_YEAR,
-                  test_start_year: int = TEST_START_YEAR):
-    """Chronological year-based split identical to Dataset_Custom."""
-    train = df[df.index.year <= train_end_year].copy()
-    test  = df[df.index.year >= test_start_year].copy()
+def split_by_calendar(df: pd.DataFrame,
+                      train_start=None, train_end=None,
+                      test_start=None, test_end=None):
+    """
+    Chronological split on the same calendar the deep models use, with the
+    validation months folded into training (see har_bounds in splits.py).
+
+    Bounds are inclusive (year, month) pairs; None is open on that side. Rows
+    outside both windows -- before `train_start` or after `test_end` -- are
+    dropped from the estimation and evaluation samples, but they were still
+    available to the rolling windows that built RV_d/RV_w/RV_m, so a bounded
+    training sample keeps a full 22-day look-back at its first row instead of
+    losing a month to NaNs.
+    """
+    train_start = TRAIN_START if train_start is None else train_start
+    train_end   = TRAIN_END   if train_end   is None else train_end
+    test_start  = TEST_START  if test_start  is None else test_start
+    test_end    = TEST_END    if test_end    is None else test_end
+
+    train = df[month_mask(df.index, train_start, train_end)].copy()
+    test  = df[month_mask(df.index, test_start,  test_end)].copy()
 
     if len(train) == 0:
         raise ValueError(
-            f"Train set is empty. Check that your data contains years <= {train_end_year}.")
+            f"Train set is empty. Check that your data covers "
+            f"{fmt_month(train_start) if train_start else 'the start of sample'}"
+            f" .. {fmt_month(train_end)}, and that --asset matches the file.")
     if len(test) == 0:
         raise ValueError(
-            f"Test set is empty. Check that your data contains years >= {test_start_year}.")
+            f"Test set is empty. Check that your data covers "
+            f"{fmt_month(test_start)} .. "
+            f"{fmt_month(test_end) if test_end else 'the end of sample'}, "
+            f"and that --asset matches the file.")
     return train, test
 
 
@@ -898,18 +1053,19 @@ def print_section(title: str):
     print(f"\n{SEP}\n  {title}\n{SEP}")
 
 def print_split_info(train: pd.DataFrame, test: pd.DataFrame, h: int):
-    print(f"\n  -- Split (follows Dataset_Custom) --------------------------")
-    print(f"  {'Set':<8} {'Rows':>6}  {'Start':>12}  {'End':>12}  {'Years'}")
-    print(f"  {THIN[:60]}")
+    print(f"\n  -- Split ({ASSET} calendar, follows Dataset_"
+          f"{ASSET.capitalize()}) ------------")
+    print(f"  {'Set':<8} {'Rows':>6}  {'Start':>12}  {'End':>12}  {'Window'}")
+    print(f"  {THIN[:64]}")
     print(f"  {'Train':<8} {len(train):>6}  "
           f"{str(train.index[0].date()):>12}  {str(train.index[-1].date()):>12}  "
-          f"{SAMPLE_START_YEAR} - {TRAIN_END_YEAR}")
+          f"{TRAIN_LABEL}")
     print(f"  {'Test':<8} {len(test):>6}  "
           f"{str(test.index[0].date()):>12}  {str(test.index[-1].date()):>12}  "
-          f"{TEST_START_YEAR} - {SAMPLE_END_YEAR}")
-    print(f"  {THIN[:60]}")
+          f"{TEST_LABEL}")
+    print(f"  {THIN[:64]}")
     print(f"  Note: OLS has no hyperparameters, so the deep models' validation")
-    print(f"        years are folded into training. Test window is identical")
+    print(f"        months are folded into training. Test window is identical")
     print(f"        to the DL models' for a like-for-like comparison.\n")
 
 def print_estimation_table(result, h: int):
@@ -951,7 +1107,7 @@ def print_estimation_table(result, h: int):
 
 def print_metrics_by_horizon(all_metrics: dict):
     print_section(f"OUT-OF-SAMPLE FORECAST EVALUATION -- ALL HORIZONS  "
-                  f"[{scale_banner()}]  (Test {TEST_START_YEAR}-{SAMPLE_END_YEAR})")
+                  f"[{scale_banner()}]  (Test {TEST_LABEL})")
     print(f"  {'Metric':<12}", end="")
     for h in HORIZONS:
         print(f"  {HORIZONS[h]['label']:>20}", end="")
@@ -1005,7 +1161,7 @@ def print_metrics_by_horizon(all_metrics: dict):
 def print_diagnostics(diag: dict, h: int):
     print_section(f"RESIDUAL DIAGNOSTICS  [h={h}, {HORIZONS[h]['label']}, "
                   f"{scale_name()} residuals, "
-                  f"Training Sample {SAMPLE_START_YEAR}-{TRAIN_END_YEAR}]")
+                  f"Training Sample {TRAIN_LABEL}]")
     print(f"  {'Statistic':<30} {'Value':>12}")
     print(THIN)
     for k, v in diag.items():
@@ -1070,7 +1226,7 @@ def figure_multi_horizon_forecast(results_dict):
             ax.axhline(0, color="black", lw=0.6, alpha=0.6)
         ax.set_ylabel(_ylab(h), fontsize=10)
         ax.set_title(f"{panel_letters[idx]}  {HORIZONS[h]['label']} -- "
-                     f"Out-of-Sample Forecast ({TEST_START_YEAR}-{SAMPLE_END_YEAR})",
+                     f"Out-of-Sample Forecast ({TEST_LABEL})",
                      loc="left", pad=4)
         ax.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
@@ -1081,8 +1237,8 @@ def figure_multi_horizon_forecast(results_dict):
 
     fig.suptitle(f"HAR-RV ({scale_name()}) Multi-Horizon Forecasts: "
                  f"h = 1, 5, 22  (Corsi, 2009)\n"
-                 f"Train: {SAMPLE_START_YEAR}-{TRAIN_END_YEAR}  |  "
-                 f"Test: {TEST_START_YEAR}-{SAMPLE_END_YEAR}",
+                 f"{ASSET} calendar -- Train: {TRAIN_LABEL}  |  "
+                 f"Test: {TEST_LABEL}",
                  fontsize=12, fontweight="bold", y=1.01)
     stem = f"{out_prefix()}_fig1_multihoriz_forecast"
     for ext in ("pdf", "png"):
@@ -1117,7 +1273,7 @@ def figure_loss_comparison(all_metrics: dict):
         ax.yaxis.set_minor_locator(AutoMinorLocator())
 
     fig.suptitle(f"HAR-RV ({scale_name()}): Out-of-Sample Loss by Horizon -- "
-                 f"Test {TEST_START_YEAR}-{SAMPLE_END_YEAR}",
+                 f"Test {TEST_LABEL}",
                  fontsize=12, fontweight="bold")
     stem = f"{out_prefix()}_fig2_loss_comparison"
     for ext in ("pdf", "png"):
@@ -1192,7 +1348,7 @@ def figure_residual_diagnostics_multihoriz(results_dict: dict):
         ax.legend(fontsize=8)
 
     fig.suptitle(f"HAR-RV ({scale_name()}): ACF of Squared Residuals -- Training "
-                 f"Sample {SAMPLE_START_YEAR}-{TRAIN_END_YEAR}  "
+                 f"Sample {TRAIN_LABEL}  "
                  f"(vertical line = NW bandwidth)",
                  fontsize=11, fontweight="bold")
     stem = f"{out_prefix()}_fig4_acf_residuals"
@@ -1238,7 +1394,7 @@ def figure_scatter_grid(results_dict: dict):
         ax.yaxis.set_minor_locator(AutoMinorLocator())
 
     fig.suptitle(f"HAR-RV ({scale_name()}): Actual vs. Predicted -- Test "
-                 f"{TEST_START_YEAR}-{SAMPLE_END_YEAR}  (all horizons)",
+                 f"{TEST_LABEL}  (all horizons)",
                  fontsize=12, fontweight="bold")
     stem = f"{out_prefix()}_fig5_scatter_grid"
     for ext in ("pdf", "png"):
@@ -1318,20 +1474,23 @@ def main(argv=None):
     # -- 10.0  Resolve command-line configuration -----------------------------
     args = parse_args(argv)
 
-    global DATA_FILE, OUT_DIR, TRAIN_END_YEAR, TEST_START_YEAR
+    global DATA_FILE, OUT_DIR, ASSET
+    global TRAIN_START, TRAIN_END, TEST_START, TEST_END
     global QLIKE_FLOOR_FRAC, NW_LAG_RULE, LOG_MODE
     DATA_FILE        = resolve_data_path(args.data)
     OUT_DIR          = args.outdir
-    TRAIN_END_YEAR   = args.train_end_year
-    TEST_START_YEAR  = args.test_start_year
+    ASSET            = args.asset
     QLIKE_FLOOR_FRAC = args.qlike_floor_frac
     NW_LAG_RULE      = args.nw_lag_rule
     LOG_MODE         = args.log
+    (TRAIN_START, TRAIN_END,
+     TEST_START, TEST_END) = resolve_split(args)
     os.makedirs(OUT_DIR, exist_ok=True)
 
     print(f"\n{SEP}")
     print(f"  HAR-RV MULTI-HORIZON MODEL  --  Corsi (2009)  --  {scale_banner()}")
-    print("  EUR/USD Realized Variance  |  Horizons: h = 1, 5, 22")
+    print(f"  Realized Variance  |  Horizons: h = 1, 5, 22  |  "
+          f"{ASSET} calendar")
     if LOG_MODE:
         print("  --log: ln( arithmetic mean of RV ) on BOTH sides -- log outside")
         print("         the sums. MSE/MAE in ln(RV) units; QLIKE after exp().")
@@ -1362,12 +1521,12 @@ def main(argv=None):
         print(f"  ln(RV) skew  : {df_base['RV'].skew():.2f}   "
               f"excess kurt: {df_base['RV'].kurt():.2f}   "
               f"<- modelling series")
-    print(f"  Split: Train {SAMPLE_START_YEAR}-{TRAIN_END_YEAR}  |  "
-          f"Test {TEST_START_YEAR}-{SAMPLE_END_YEAR}")
+    print(f"  Split ({ASSET}): Train {TRAIN_LABEL}  |  Test {TEST_LABEL}")
 
     # Floor is a raw-variance quantity, so it always comes from RV_raw.
     floor = QLIKE_FLOOR_FRAC * float(
-        df_base.loc[df_base.index.year <= TRAIN_END_YEAR, "RV_raw"].mean())
+        df_base.loc[month_mask(df_base.index, TRAIN_START, TRAIN_END),
+                    "RV_raw"].mean())
     print(f"  QLIKE floor for non-positive forecasts: {floor:.3e}"
           + ("  (cannot bind under --log)" if LOG_MODE else ""))
 
@@ -1380,7 +1539,7 @@ def main(argv=None):
         print(f"{'-'*72}")
 
         df_h        = build_horizon_target(df_base, h)
-        train, test = split_by_year(df_h, TRAIN_END_YEAR, TEST_START_YEAR)
+        train, test = split_by_calendar(df_h)
         print_split_info(train, test, h)
 
         result = fit_har_rv(train, h)
@@ -1439,7 +1598,7 @@ def main(argv=None):
     # -- 10.6  Summary ---------------------------------------------------------
     print(f"\n{SEP}")
     print(f"  FINAL SUMMARY -- OUT-OF-SAMPLE TEST SET  "
-          f"({TEST_START_YEAR}-{SAMPLE_END_YEAR})  [{scale_banner()}]")
+          f"({TEST_LABEL})  [{scale_banner()}]")
     print(THIN)
     mse_hdr = "MSE[ln]" if LOG_MODE else "MSE"
     mae_hdr = "MAE[ln]" if LOG_MODE else "MAE"
@@ -1507,11 +1666,14 @@ def main(argv=None):
 
   Split:""")
     print(f"""\
-    Train  {SAMPLE_START_YEAR} - {TRAIN_END_YEAR}  (year <= {TRAIN_END_YEAR})
-    Test   {TEST_START_YEAR} - {SAMPLE_END_YEAR}   (year >= {TEST_START_YEAR})
-    Dataset_Custom (data_loader.py) splits train / val / test at the same
-    year boundaries; HAR-RV has no hyperparameters, so its validation years
-    are folded into the estimation sample. The test window is shared.
+    Calendar  {ASSET}   (data_provider/splits.py)
+    Train     {TRAIN_LABEL}
+    Test      {TEST_LABEL}
+    Dataset_{ASSET.capitalize()} (data_loader.py) splits train / val / test on
+    exactly these boundaries -- both read them from splits.py. HAR-RV has no
+    hyperparameters, so its validation months are folded into the estimation
+    sample; the test window is shared, which is what keeps the out-of-sample
+    losses comparable. Run the deep models with --data {ASSET} to match.
 
   References:
     Corsi, F. (2009). A simple approximate long-memory model of realized
