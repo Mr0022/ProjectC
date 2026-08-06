@@ -5,6 +5,7 @@ from utils.metrics import metric, QLIKE, lognormal_back_transform
 import torch
 import torch.nn as nn
 from torch import optim
+from torch.utils.data import DataLoader
 import os
 import time
 import math
@@ -194,7 +195,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         # variance level, so undo that first -- on z-scores the mean collapses
         # to ~0 and the floor with it. Then keep only the target column, which
         # is the one the forecasts and QLIKE actually concern.
-        train_data, train_loader = self._get_data(flag='train')
+        train_data, _ = self._get_data(flag='train')
         train_series = np.asarray(train_data.data_x, dtype=float)
         if getattr(train_data, 'scaler_stats', None) is not None:
             train_series = train_data.inverse_transform(train_series)
@@ -217,7 +218,17 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         else:
             # Correction terms from TRAINING residuals only -- using test
             # residuals would leak the out-of-sample outcome into the forecast.
-            tr_p, tr_t = self._forward_collect(train_loader)
+            #
+            # Measured over a SEQUENTIAL pass of the whole training split, not
+            # over train_loader: that one shuffles and drops its last partial
+            # batch, so the moments would be estimated from a random subset
+            # that changes with the RNG state, and two runs of the same command
+            # would report different QLIKE / MSE_RV. The correction is part of
+            # the forecast, so it has to be reproducible.
+            full_train = DataLoader(train_data, batch_size=self.args.batch_size,
+                                    shuffle=False, drop_last=False,
+                                    num_workers=self.args.num_workers)
+            tr_p, tr_t = self._forward_collect(full_train)
             resid = tr_t - tr_p
             bias = float(resid.mean())
             resid_var = float(resid.var(ddof=1))
@@ -225,8 +236,14 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             actual_rv = np.exp(trues)
             pred_rv = lognormal_back_transform(preds, resid_var, bias)
             pred_naive = lognormal_back_transform(preds)
-            q, n_bad = QLIKE(actual_rv, pred_rv, floor)
-            q_naive, _ = QLIKE(actual_rv, pred_naive, floor)
+            # QLIKE(pred, true): the ratio is actual/forecast, and the loss is
+            # NOT symmetric in it -- feeding the inverse gives 1/r + ln r - 1,
+            # a different loss that agrees with this one only to second order.
+            # The raw branch above passes (forecast, actual) and so must this,
+            # or a --log run cannot be set beside HAR-RV_RUN.PY, whose qlike()
+            # takes (actual, predicted) and computes the same ratio.
+            q, n_bad = QLIKE(pred_rv, actual_rv, floor)
+            q_naive, _ = QLIKE(pred_naive, actual_rv, floor)
             shift = np.exp(bias + resid_var / 2.0)
             metrics = {'MSE [ln]': float(np.mean((trues - preds) ** 2)),
                        'MAE [ln]': float(np.mean(np.abs(trues - preds))),
