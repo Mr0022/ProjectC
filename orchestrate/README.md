@@ -101,9 +101,11 @@ orchestrate/results/
 ├── har/<dataset>/har_rv_log_*.csv|png|pdf         HAR-RV_RUN.PY's own output, untouched
 ├── tables/metrics.csv                             one row per (dataset, horizon, model, seed)
 ├── tables/metrics_mean.csv                        seed mean ± std
+├── tables/metrics_seedmean.csv                    metrics of the seed-AVERAGED forecast
 ├── tables/pivot_<metric>_h<hh>.csv                models × datasets, one metric, one horizon
 ├── forecasts/<dataset>_h<hh>__seed<S>.csv         actuals + every model's forecast, both scales
-├── losses/<dataset>_h<hh>__<loss>__seed<S>.csv    ← the DM / MCS input
+├── losses/<dataset>_h<hh>__<loss>__seed<S>.csv    ← the DM / MCS input, per seed
+├── losses/<dataset>_h<hh>__<loss>__seedmean.csv   ← and for the seed-averaged forecast
 ├── failures.csv                                   cells that failed, and why
 └── manifest.json                                  coverage, dates, QLIKE floors, checks
 ```
@@ -133,9 +135,21 @@ arithmetic forward mean.
 ## 5. Running DM and MCS
 
 `losses/<dataset>_h<hh>__<loss>__seed<S>.csv` is a date-indexed matrix, one row
-per forecast and one column per model — **one file per seed**, so `--itr 10`
-gives ten of them per loss. Run the test on one seed, or per seed and report
-the spread.
+per forecast and one column per model — one file per seed, so `--itr 10` gives
+ten of them per loss.
+
+**Run the tests on `__seedmean`.** It is the same matrix for the forecast each
+model's ten repeats average to: one series per model, so one DM statistic and
+one MCS instead of ten that cannot be pooled. The repeats are averaged on both
+scales separately — the ln-scale losses see the mean ln forecast, QLIKE and the
+variance-scale losses see the mean variance forecast — and HAR-RV, being
+deterministic, is carried through unchanged. Its metrics are in
+`tables/metrics_seedmean.csv`, and they are **not** the seed means in
+`metrics_mean.csv`: the loss of an average sits below the average of the losses
+whenever the loss is convex, so the ensemble reads better than any single
+repeat. It is a different forecast, not a smoothed report of the same one — use
+`metrics_mean.csv` (mean ± std) when the table is about one model, and the
+`seedmean` files when the question is which model wins.
 
 The losses, for each of:
 
@@ -152,7 +166,7 @@ table and the tests cannot disagree.
 
 ```python
 import pandas as pd
-L = pd.read_csv('orchestrate/results/losses/EURUSD_h05__qlike__seed2021.csv',
+L = pd.read_csv('orchestrate/results/losses/EURUSD_h05__qlike__seedmean.csv',
                 index_col=0, parse_dates=True)
 d = L['TimeMixer'] - L['HAR-RV']          # DM loss differential
 M = L.values                              # MCS: T × 11 loss matrix

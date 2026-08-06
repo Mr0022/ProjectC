@@ -175,6 +175,66 @@ def model_order(names):
     return known + sorted(n for n in names if n not in set(MODELS))
 
 
+def seedmean_members(cells):
+    """{model: (pred_ln, pred_rv, n_seeds)} — the repeats averaged into one forecast.
+
+    Averaged on BOTH scales separately, because each loss is defined on one of
+    them: the ln-scale losses see the mean ln forecast, and QLIKE / the
+    variance-scale losses see the mean variance forecast, which is the
+    conditional mean they are minimised by. Passing one through exp() to get
+    the other would give the geometric mean of the repeats instead.
+
+    HAR-RV is deterministic and has a single cell, so it passes through
+    unchanged and stays comparable to the ensembles.
+    """
+    frames = defaultdict(list)
+    for (model, _), (frame, _) in cells.items():
+        frames[model].append(frame)
+    return {model: (np.mean([f['pred_ln'].values for f in group], axis=0),
+                    np.mean([f['pred_rv'].values for f in group], axis=0),
+                    len(group))
+            for model, group in frames.items()}
+
+
+def write_seedmean(results_dir, dataset, asset, h, cells, target, floor):
+    """The seed-averaged forecast and its loss matrices, plus its metric rows.
+
+    With --itr 10 there are ten per-seed loss matrices per block and no
+    principled way to combine ten DM statistics, so this is the single series
+    to run the tests on: one forecast per model, the ensemble of its repeats.
+
+    Its metrics are NOT the seed means in metrics_mean.csv -- the loss of an
+    average is below the average of the losses whenever the loss is convex, so
+    the ensemble reads better than any repeat. It is a different (and better)
+    forecast, not a smoothed report of the same one.
+    """
+    members = seedmean_members(cells)
+    order = model_order(members)
+    dates = target.index
+    stem = f'{dataset}_h{h:02d}'
+
+    wide = pd.DataFrame(index=dates)
+    wide['y_ln'] = target.values
+    wide['y_rv'] = np.exp(target.values)
+    losses, rows = {}, []
+    for model in order:
+        pred_ln, pred_rv, n_seeds = members[model]
+        wide[f'{model}__ln'] = pred_ln
+        wide[f'{model}__rv'] = pred_rv
+        losses[model] = per_obs_losses(pred_ln, pred_rv, target.values, floor)
+        row = {'dataset': dataset, 'asset': asset, 'horizon': h,
+               'model': model, 'n_seeds': n_seeds, 'n_obs': len(dates)}
+        row.update(summarize_losses(losses[model]))
+        rows.append(row)
+    wide.to_csv(os.path.join(results_dir, 'forecasts', f'{stem}__seedmean.csv'))
+
+    for loss in LOSS_TO_METRIC:
+        pd.DataFrame({model: losses[model][loss] for model in order},
+                     index=dates, columns=order).to_csv(
+            os.path.join(results_dir, 'losses', f'{stem}__{loss}__seedmean.csv'))
+    return rows
+
+
 def write_block(results_dir, dataset, h, cells, target, complete):
     """Forecast and loss files for one (dataset, horizon) block, per seed."""
     forecasts_dir = os.path.join(results_dir, 'forecasts')
@@ -218,9 +278,18 @@ def write_block(results_dir, dataset, h, cells, target, complete):
               f'missing ones before using it.')
 
 
-def write_tables(results_dir, rows):
+def write_tables(results_dir, rows, seedmean_rows=()):
     tables_dir = os.path.join(results_dir, 'tables')
     os.makedirs(tables_dir, exist_ok=True)
+
+    if len(seedmean_rows):
+        ensemble = pd.DataFrame(list(seedmean_rows))
+        ensemble['model'] = pd.Categorical(
+            ensemble['model'], categories=model_order(ensemble['model'].unique()),
+            ordered=True)
+        ensemble = ensemble.sort_values(['dataset', 'horizon', 'model'])
+        ensemble.to_csv(os.path.join(tables_dir, 'metrics_seedmean.csv'),
+                        index=False)
 
     frame = pd.DataFrame(rows)
     # Nullable Int64: HAR-RV has no seed, and a plain int column with one
@@ -283,7 +352,7 @@ def aggregate(results_dir=DEFAULT_RESULTS_DIR, strict=False, quiet=False):
     check_targets(rows, strict)
 
     expected_models = set(MODELS)
-    coverage = {}
+    coverage, seedmean_rows = {}, []
     for (dataset, h), cells in sorted(blocks.items()):
         target = targets[(dataset, h)]
         dates = target.index
@@ -294,8 +363,14 @@ def aggregate(results_dir=DEFAULT_RESULTS_DIR, strict=False, quiet=False):
             'first': str(dates[0].date()), 'last': str(dates[-1].date()),
             'models': sorted(present), 'missing': missing}
         write_block(results_dir, dataset, h, cells, target, not missing)
+        # One repeat is not an ensemble, and its seedmean files would only
+        # duplicate the per-seed ones.
+        if len(block_seeds(cells)) > 1:
+            seedmean_rows += write_seedmean(
+                results_dir, dataset, dataset_spec(dataset).asset, h, cells,
+                target, floors[dataset])
 
-    frame, summary = write_tables(results_dir, rows)
+    frame, summary = write_tables(results_dir, rows, seedmean_rows)
 
     manifest = {
         'generated': time.strftime('%Y-%m-%d %H:%M:%S'),
