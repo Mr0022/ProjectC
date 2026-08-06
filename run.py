@@ -69,7 +69,12 @@ def build_parser():
     # Defaults describe the shipped EUR/USD realized-variance dataset, so a bare
     # `python run.py --task_name long_term_forecast --is_training 1
     #  --model_id x --model DLinear` trains on data/EURUSD-RV.csv.
-    parser.add_argument('--data', type=str, default='custom', help='dataset type')
+    parser.add_argument('--data', type=str, default='custom',
+                        help='dataset type / split calendar, options: [forex '
+                             '(= custom): train 2012-01..2022-12, val 2023-01..'
+                             '2024-12, test 2025-01..end; crypto: train 2018-06'
+                             '..2024-06, val 2024-07..2025-06, test 2025-07..'
+                             '2026-06]')
     parser.add_argument('--root_path', type=str, default='./data/', help='root path of the data file')
     parser.add_argument('--data_path', type=str, default='EURUSD-RV.csv', help='data file')
     parser.add_argument('--features', type=str, default='S',

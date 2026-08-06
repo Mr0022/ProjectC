@@ -1,12 +1,24 @@
-from data_provider.data_loader import Dataset_Custom, Dataset_Pred
+from data_provider.data_loader import (Dataset_Custom, Dataset_Forex,
+                                       Dataset_Crypto, Dataset_Pred)
 from torch.utils.data import DataLoader
 
+# The two asset classes differ only in their train/val/test calendar; see the
+# FOREX and CRYPTO sections of data_loader.py.
+#   forex   train 2012-01..2022-12 | val 2023-01..2024-12 | test 2025-01..end
+#   crypto  train 2018-06..2024-06 | val 2024-07..2025-06 | test 2025-07..2026-06
+# 'custom' is kept as an alias of 'forex' so existing FX scripts run unchanged.
 data_dict = {
-    'custom': Dataset_Custom,
+    'custom': Dataset_Forex,
+    'forex': Dataset_Forex,
+    'crypto': Dataset_Crypto,
 }
 
 
 def data_provider(args, flag):
+    if args.data not in data_dict:
+        raise KeyError(
+            f"unknown --data '{args.data}'; choose one of "
+            f"{', '.join(sorted(data_dict))}")
     Data = data_dict[args.data]
     timeenc = 0 if args.embed != 'timeF' else 1
 
@@ -42,9 +54,9 @@ def data_provider(args, flag):
         # Train-split StandardScaler, on by default like the Time-Series-Library.
         scale=bool(getattr(args, 'scale', 1)),
     )
-    # Realized-variance options; only Dataset_Custom understands them, and
-    # both default to off so every other dataset behaves exactly as before.
-    if Data is Dataset_Custom:
+    # Realized-variance options; only the Dataset_Custom family understands
+    # them, and both default to off so every other dataset behaves as before.
+    if issubclass(Data, Dataset_Custom):
         kwargs['log'] = getattr(args, 'log', False)
         kwargs['drop_nonpositive'] = getattr(args, 'drop_nonpositive', False)
 
