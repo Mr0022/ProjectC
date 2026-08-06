@@ -368,9 +368,11 @@ def load_anchor(model, anchor_dir=None, dataset=None):
     seq_len = int(flags.get('seq_len', [SEQ_LEN])[0])
     if seq_len != SEQ_LEN:
         raise ValueError(
-            f'{path}: seq_len is {seq_len}, but the benchmark derives its test '
-            f'dates for seq_len={SEQ_LEN}. Pass --seq_len to run_benchmark.py '
-            f'if the protocol really changed.')
+            f'{path}: seq_len is {seq_len}, but the grid runs at '
+            f'{SEQ_LEN}. One look-back for every model is what makes the table '
+            f'a comparison of architectures; if the protocol really changed, '
+            f'change SEQ_LEN in orchestrate/benchmark_config.py so the test '
+            f'window is derived for the same value.')
     for required in ('aggregate_mean', 'log'):
         if required not in flags:
             raise ValueError(
