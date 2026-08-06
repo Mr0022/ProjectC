@@ -454,15 +454,23 @@ def save_cell(path, pred_ln, pred_rv, true_ln, dates, meta):
     what QLIKE is defined on, and the Jensen terms that connect them are part
     of the fitted model. Storing all three means the scoring code applies no
     model-specific correction of its own.
+
+    Written to a temporary file and renamed, so the cell either exists in full
+    or does not exist at all. A sweep is expected to be interrupted, and the
+    resume rule is "the file is there" -- a half-written .npz from a kill
+    mid-write would be skipped forever and then fail the scoring pass.
     """
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    np.savez(path,
+    tmp = f'{path}.tmp'
+    np.savez(tmp,
              pred_ln=np.asarray(pred_ln, dtype=float),
              pred_rv=np.asarray(pred_rv, dtype=float),
              true_ln=np.asarray(true_ln, dtype=float),
              dates=np.asarray([str(d) for d in
                                pd.DatetimeIndex(dates).strftime('%Y-%m-%d')]),
              meta=json.dumps(meta, sort_keys=True))
+    # np.savez appends .npz unless the name already ends in it.
+    os.replace(tmp if tmp.endswith('.npz') else f'{tmp}.npz', path)
 
 
 def load_cell(path):
