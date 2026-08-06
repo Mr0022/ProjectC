@@ -91,6 +91,11 @@ HORIZONS = (1, 5, 22)
 # it (see test_target_dates).
 SEQ_LEN = 96
 DEFAULT_SEED = 2021
+# Repeats per cell. Ten is what a benchmark table needs: the initialisation
+# spread on these splits is comparable to the gap between neighbouring models,
+# so a single run reports a draw rather than a model. Seeds follow run.py's
+# rule -- repeat i uses (--seed + i) -- so 10 x DEFAULT_SEED means 2021..2030.
+DEFAULT_N_SEEDS = 10
 DEFAULT_TRAIN_EPOCHS = 30
 DEFAULT_PATIENCE = 7
 
@@ -101,6 +106,16 @@ QLIKE_FLOOR_FRAC = 1e-4
 
 TARGET_COL = 'RV'
 DATE_COL = 'date'
+
+
+def seed_list(base=DEFAULT_SEED, n_seeds=DEFAULT_N_SEEDS):
+    """The seeds of an --itr n_seeds sweep: base, base+1, ... base+n-1.
+
+    run.py's own rule, so `--itr N --seed S` there and the N cells this sweep
+    trains are the same N runs -- it simply shards them into one process each,
+    which is what makes an individual repeat resumable and separately scorable.
+    """
+    return [base + i for i in range(n_seeds)]
 
 
 def dataset_names(assets=None):

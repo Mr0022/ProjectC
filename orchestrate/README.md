@@ -45,8 +45,14 @@ Every deep-model cell runs under the flags the tuning study used:
 
 ```
 --aggregate_mean --log --features S --target RV --seq_len 96 --label_len 48
---train_epochs 30 --patience 7 --itr 1 --seed 2021
+--train_epochs 30 --patience 7
 ```
+
+Each cell is repeated **`--itr 10`** times, seeds 2021–2030 — run.py's rule
+that repeat *i* uses `--seed + i`, so `--itr N --seed S` here and in `run.py`
+are the same N runs, one subprocess each. That is 3 000 trainings; `--itr 3`
+is the cheaper setting.
+
 
 so the model emits **one** number per window — `ln( mean(RV) )` over the next h
 days — which is exactly HAR-RV's target `Y^(h)`. HAR-RV is fitted by
@@ -127,7 +133,11 @@ arithmetic forward mean.
 ## 5. Running DM and MCS
 
 `losses/<dataset>_h<hh>__<loss>__seed<S>.csv` is a date-indexed matrix, one row
-per forecast and one column per model, for each of:
+per forecast and one column per model — **one file per seed**, so `--itr 10`
+gives ten of them per loss. Run the test on one seed, or per seed and report
+the spread.
+
+The losses, for each of:
 
 | file suffix | loss |
 |---|---|

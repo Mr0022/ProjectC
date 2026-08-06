@@ -16,7 +16,7 @@ scored on identical rows against identical actuals. HAR-RV itself is fitted by
     python orchestrate/run_benchmark.py --assets crypto
     python orchestrate/run_benchmark.py --models DLinear FITS --horizons 1
     python orchestrate/run_benchmark.py --quick              # 5 epochs, smoke test
-    python orchestrate/run_benchmark.py --seeds 2021 2022 2023
+    python orchestrate/run_benchmark.py --itr 3             # 3 repeats instead of 10
 
 What a cell writes
 ------------------
@@ -67,10 +67,10 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 from orchestrate.benchmark_config import (  # noqa: E402
-    DEEP_MODELS, DEFAULT_ANCHOR_DIR, DEFAULT_PATIENCE, DEFAULT_RESULTS_DIR,
-    DEFAULT_SEED, DEFAULT_TRAIN_EPOCHS, HAR_MODEL, HORIZONS,
-    anchor_argv, cell_id, cell_path, dataset_names, dataset_spec,
-    discover_anchors, save_cell, test_target_dates)
+    DEEP_MODELS, DEFAULT_ANCHOR_DIR, DEFAULT_N_SEEDS, DEFAULT_PATIENCE,
+    DEFAULT_RESULTS_DIR, DEFAULT_SEED, DEFAULT_TRAIN_EPOCHS, HAR_MODEL,
+    HORIZONS, anchor_argv, cell_id, cell_path, dataset_names, dataset_spec,
+    discover_anchors, save_cell, seed_list, test_target_dates)
 
 FAILURE_FIELDS = ['dataset', 'horizon', 'model', 'seed', 'when', 'why']
 
@@ -446,11 +446,16 @@ def main(argv=None):
                     help='restrict to an asset class')
     ap.add_argument('--horizons', nargs='+', type=int, default=list(HORIZONS),
                     metavar='H', help='forecast horizons (default: 1 5 22)')
-    ap.add_argument('--seeds', nargs='+', type=int, default=[DEFAULT_SEED],
+    ap.add_argument('--itr', type=int, default=DEFAULT_N_SEEDS, metavar='N',
+                    help='repeats per cell; repeat i uses seed (--seed + i), '
+                         'exactly run.py\'s rule. Each repeat is its own '
+                         'subprocess and its own file, so one can fail or be '
+                         'resumed without the other nine')
+    ap.add_argument('--seed', type=int, default=DEFAULT_SEED, metavar='SEED',
+                    help='base seed for --itr')
+    ap.add_argument('--seeds', nargs='+', type=int, default=None,
                     metavar='SEED',
-                    help='seeds per deep-model cell. One is enough for the '
-                         'headline table; more gives the initialisation spread, '
-                         'and each seed produces its own DM/MCS loss matrix')
+                    help='explicit seed list, overriding --itr/--seed')
     ap.add_argument('--train_epochs', type=int, default=DEFAULT_TRAIN_EPOCHS)
     ap.add_argument('--patience', type=int, default=DEFAULT_PATIENCE)
     ap.add_argument('--checkpoint_dir', default='./checkpoints/benchmark',
@@ -477,12 +482,12 @@ def main(argv=None):
     ap.add_argument('--no_aggregate', action='store_true',
                     help='skip the tables/ and losses/ build at the end')
 
-    # --worker: internal. One cell, in this process, then exit.
+    # --worker: internal. One cell, in this process, then exit. It reuses
+    # --seed for the one seed it trains, so there is nothing to keep in sync.
     ap.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     ap.add_argument('--model', help=argparse.SUPPRESS)
     ap.add_argument('--dataset', help=argparse.SUPPRESS)
     ap.add_argument('--horizon', type=int, help=argparse.SUPPRESS)
-    ap.add_argument('--seed', type=int, help=argparse.SUPPRESS)
     ap.add_argument('--out', help=argparse.SUPPRESS)
 
     args = ap.parse_args(argv)
@@ -508,6 +513,10 @@ def main(argv=None):
     unknown = [h for h in args.horizons if h < 1]
     if unknown:
         ap.error(f'horizons must be >= 1, got {unknown}')
+
+    if args.itr < 1:
+        ap.error(f'--itr must be >= 1, got {args.itr}')
+    args.seeds = args.seeds or seed_list(args.seed, args.itr)
 
     requested = args.models or list(DEEP_MODELS) + [HAR_MODEL]
     unknown = [m for m in requested
@@ -540,7 +549,9 @@ def main(argv=None):
     print(f'  models    : {len(args.deep_models)} deep'
           + (f' + {HAR_MODEL}' if HAR_MODEL in args.models else '')
           + f'  [{", ".join(args.deep_models)}]')
-    print(f'  seeds     : {", ".join(str(s) for s in args.seeds)}')
+    seeds = args.seeds
+    print(f'  seeds     : {len(seeds)} per cell  '
+          f'[{seeds[0]}' + (f'..{seeds[-1]}]' if len(seeds) > 1 else ']'))
     print(f'  to train  : {total} deep-model cell(s), '
           f'{len(har_datasets)} HAR-RV fit(s), '
           f'{args.train_epochs} epochs max each')
