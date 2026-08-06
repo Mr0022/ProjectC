@@ -6,7 +6,7 @@ per-observation loss series that Diebold–Mariano and the Model Confidence Set
 need.
 
 ```bash
-python orchestrate/run_benchmark.py                    # the whole grid (300 trainings + 10 HAR fits)
+python orchestrate/run_benchmark.py                    # the whole grid (3000 trainings + 10 HAR fits)
 python orchestrate/run_benchmark.py --dry_run          # print the plan, train nothing
 python orchestrate/run_benchmark.py --validate         # build every config, forward one batch, stop
 python orchestrate/run_benchmark.py --assets crypto    # or --datasets btcusdt --models FITS --horizons 5
@@ -28,8 +28,8 @@ git-ignored — `results/` matches at any depth.
 | **Crypto** | btcusdt, ethusdt, adausdt, bnbusdt, xrpusdt — train 2018-06..2024-06 / val 2024-07..2025-06 / test 2025-07..2026-06 |
 | **Horizons** | h = 1, 5, 22 |
 
-10 × 10 × 3 = **300 deep-model cells** plus **10 HAR-RV fits** (one fit covers
-all three horizons). Splits come from `data_provider/splits.py`, so both model
+10 × 10 × 3 = **300 deep-model cells**, each repeated over 10 seeds, plus
+**10 HAR-RV fits** (one fit covers all three horizons). Splits come from `data_provider/splits.py`, so both model
 families read the same calendar.
 
 Forecasts per test window, after the h−1 embargo at each edge:
@@ -44,20 +44,50 @@ Forecasts per test window, after the h−1 embargo at each edge:
 Every deep-model cell runs under the flags the tuning study used:
 
 ```
---aggregate_mean --log --features S --target RV --seq_len 96 --label_len 48
+--aggregate_mean --features S --target RV --seq_len 96 --label_len 48
 --train_epochs 30 --patience 7
 ```
+
+so the model emits **one** number per window — the mean of RV over the next h
+days — which is exactly HAR-RV's target `Y^(h)`. HAR-RV is fitted by
+`HAR-RV_RUN.PY`, unmodified. Same target, same rows, same actuals, so the two
+families' losses can be set side by side and fed to the same tests.
 
 Each cell is repeated **`--itr 10`** times, seeds 2021–2030 — run.py's rule
 that repeat *i* uses `--seed + i`, so `--itr N --seed S` here and in `run.py`
 are the same N runs, one subprocess each. That is 3 000 trainings; `--itr 3`
 is the cheaper setting.
 
+### Scale: `--log` or raw
 
-so the model emits **one** number per window — `ln( mean(RV) )` over the next h
-days — which is exactly HAR-RV's target `Y^(h)`. HAR-RV is fitted by
-`HAR-RV_RUN.PY --log`, unmodified. Same target, same rows, same actuals, so the
-two families' losses can be set side by side and fed to the same tests.
+The scale is a property of the **anchor**, not a flag of the sweep — a model is
+scored on the scale it was tuned and trained on:
+
+| anchor's command line | scale | target | QLIKE computed on |
+|---|---|---|---|
+| has `--log` | `ln_RV` | `ln( mean RV )` | the Jensen back-transform `exp(pred + bias + σ²/2)` |
+| no `--log` | `raw_RV` | `mean RV` | the forecast itself |
+
+The tuned anchors in `tuning/ProjectC_tuning` all carry `--log`, so today every
+sweep is `ln_RV`. Tune a study without `--log`, point `--anchor_dir` at it, and
+the whole pipeline follows: the target, HAR-RV's own invocation, the losses and
+the tables. Nothing needs a flag — `run_benchmark.py` prints the scale it
+derived, and refuses a sweep whose anchors disagree, because one table cannot
+carry MSE in two different units. Give the raw sweep its own `--results_dir`.
+
+What changes in raw mode:
+
+* **No Jensen correction** — a raw model forecasts the variance directly, so
+  the extra training pass is skipped and `bias`/`resid_var` are 0.
+* **`MSE_ln`/`MAE_ln` are empty**, and no `se_ln`/`ae_ln` loss matrices are
+  written: a raw forecast can be ≤ 0, where the log does not exist.
+* **Non-positive forecasts become possible.** MSE/MAE are measured against
+  `max(forecast, 0)` and QLIKE floors them at `1e-4 × mean training RV`, the
+  same two rules `HAR-RV_RUN.PY` and `Exp_Long_Term_Forecast` apply;
+  `n_floored` in `metrics.csv` counts them.
+* **`MSE_RV`, `MAE_RV` and `QLIKE` stay comparable to a `--log` sweep** — `exp()`
+  of the log target is the raw target exactly, at every horizon, so the two
+  runs are scored against identical actuals on that scale.
 
 `pred_len` is the only thing the horizon changes. Under `--aggregate_mean` the
 forecast head is always built with `pred_len = 1`
@@ -98,12 +128,12 @@ picks it up automatically. Nothing else changes.
 ```
 orchestrate/results/
 ├── runs/<dataset>/h<hh>/<Model>_seed<seed>.npz    per-observation forecasts (the raw record)
-├── har/<dataset>/har_rv_log_*.csv|png|pdf         HAR-RV_RUN.PY's own output, untouched
+├── har/<dataset>/har_rv[_log]_*.csv|png|pdf      HAR-RV_RUN.PY's own output, untouched
 ├── tables/metrics.csv                             one row per (dataset, horizon, model, seed)
 ├── tables/metrics_mean.csv                        seed mean ± std
 ├── tables/metrics_seedmean.csv                    metrics of the seed-AVERAGED forecast
 ├── tables/pivot_<metric>_h<hh>.csv                models × datasets, one metric, one horizon
-├── forecasts/<dataset>_h<hh>__seed<S>.csv         actuals + every model's forecast, both scales
+├── forecasts/<dataset>_h<hh>__seed<S>.csv         y_pred_scale, y_rv + <Model>__pred, <Model>__rv
 ├── losses/<dataset>_h<hh>__<loss>__seed<S>.csv    ← the DM / MCS input, per seed
 ├── losses/<dataset>_h<hh>__<loss>__seedmean.csv   ← and for the seed-averaged forecast
 ├── failures.csv                                   cells that failed, and why
@@ -120,17 +150,19 @@ at any time.
 
 | column | meaning |
 |---|---|
-| `MSE_ln`, `MAE_ln` | errors in **ln(RV)** — the scale the networks are trained on and HAR-RV `--log` is fitted on |
+| `scale` | `ln_RV` or `raw_RV` — which scale this cell was fitted and is reported on |
+| `MSE_ln`, `MAE_ln` | errors in **ln(RV)**. `--log` sweeps only; empty for a raw cell |
 | `MSE_RV`, `MAE_RV` | the same errors after the lognormal back-transform, on the **variance** scale |
 | `QLIKE` | `mean( RV/RV̂ − ln(RV/RV̂) − 1 )` (Patton, 2011), a variance loss, hence computed on the back-transformed forecast |
 | `bias`, `resid_var` | the Jensen terms: `RV̂ = exp(pred + bias + σ²/2)`, both measured on **training** residuals |
-| `n_floored` | non-positive variance forecasts floored for QLIKE — **0 under `--log` by construction** |
+| `n_floored` | non-positive variance forecasts floored for QLIKE — 0 under `--log` by construction, possible on the raw scale |
 | `target_dev` | how far this cell's own actuals sit from `Y^(h)` rebuilt from the CSV (see §6) |
 | `val_loss` | MSE on the full validation split for the checkpoint early stopping kept |
 
 `ln`-scale and `RV`-scale losses are **not** comparable to each other; either is
 comparable across models and horizons, because both families predict the same
-arithmetic forward mean.
+arithmetic forward mean. The `RV` columns are comparable across scales too, so
+a raw sweep and a `--log` one can be set side by side there.
 
 ## 5. Running DM and MCS
 
@@ -155,8 +187,8 @@ The losses, for each of:
 
 | file suffix | loss |
 |---|---|
-| `se_ln` | squared error, ln(RV) |
-| `ae_ln` | absolute error, ln(RV) |
+| `se_ln` | squared error, ln(RV) — `--log` sweeps only |
+| `ae_ln` | absolute error, ln(RV) — `--log` sweeps only |
 | `qlike` | QLIKE, variance scale |
 | `se_rv` | squared error, variance scale |
 | `ae_rv` | absolute error, variance scale |

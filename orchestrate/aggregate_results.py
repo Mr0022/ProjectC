@@ -25,13 +25,16 @@ What it writes, under ``<results_dir>``
     shape a results table in a paper has.
 
 ``forecasts/<dataset>_h<hh>__seed<S>.csv``
-    Date-indexed actuals and every model's forecast, on both scales. Everything
+    Date-indexed actuals (``y_pred_scale``, ``y_rv``) and every model's
+    forecast on both scales (``<Model>__pred``, ``<Model>__rv``). Everything
     below is derived from this, so any other loss can be built from it without
     re-reading the .npz files.
 
 ``losses/<dataset>_h<hh>__<loss>__seed<S>.csv``
     THE FILES THE TESTS CONSUME. Date-indexed, one column per model, one row
-    per forecast, for each of se_ln, ae_ln, qlike, se_rv, ae_rv.
+    per forecast, for each of se_ln, ae_ln, qlike, se_rv, ae_rv -- the two
+    ln-scale ones only for a ``--log`` sweep, where the log of a forecast
+    exists.
 
       * Diebold-Mariano compares two columns: d_t = L_i,t - L_j,t, and the
         statistic is mean(d) / sqrt(HAC var(d) / T). The h-day targets overlap,
@@ -60,7 +63,7 @@ import json
 import os
 import sys
 import time
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, namedtuple
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
@@ -71,9 +74,13 @@ import pandas as pd  # noqa: E402
 
 from orchestrate.benchmark_config import (  # noqa: E402
     DEFAULT_RESULTS_DIR, LOSS_TO_METRIC, MODELS, TARGET_TOL, dataset_spec,
-    horizon_target, load_cell, per_obs_losses, qlike_floor, summarize_losses)
+    horizon_target, is_log, load_cell, per_obs_losses, qlike_floor,
+    summarize_losses)
 
-IDENTITY = ['dataset', 'asset', 'horizon', 'model', 'seed']
+# One stored cell, as the block assembly and the writers see it.
+Cell = namedtuple('Cell', ['frame', 'losses', 'scale'])
+
+IDENTITY = ['dataset', 'asset', 'horizon', 'model', 'seed', 'scale']
 METRIC_COLS = list(LOSS_TO_METRIC.values())
 EXTRA_COLS = ['n_obs', 'n_floored', 'target_dev', 'bias', 'resid_var',
               'val_loss', 'n_params', 'seconds']
@@ -108,24 +115,30 @@ def collect(results_dir):
     for path in paths:
         frame, meta = load_cell(path)
         dataset, h = meta['dataset'], int(meta['horizon'])
+        scale, log_mode = meta['scale'], is_log(meta['scale'])
         spec = dataset_spec(dataset)
         if dataset not in floors:
             floors[dataset] = qlike_floor(spec)
-        if (dataset, h) not in targets:
-            targets[(dataset, h)] = horizon_target(spec, h)
-        floor, target = floors[dataset], targets[(dataset, h)]
+        # Keyed by scale as well: the actuals are ln(mean RV) for a --log cell
+        # and mean RV for a raw one, and a block may legitimately hold both.
+        if (dataset, h, scale) not in targets:
+            targets[(dataset, h, scale)] = horizon_target(spec, h, log_mode)
+        floor, target = floors[dataset], targets[(dataset, h, scale)]
 
         if not frame.index.equals(target.index):
             print(f'[WARN] {os.path.relpath(path, results_dir)}: forecast dates '
                   f'do not match the {spec.asset} calendar; cell skipped.')
             continue
-        deviation = float(np.max(np.abs(frame['true_ln'].values
-                                        - target.values)))
+        deviation = float(np.max(np.abs(frame['true'].values - target.values)))
+        if not log_mode:
+            # A raw-scale deviation is a variance, so judge it relative to the
+            # level of RV rather than against a fixed tolerance in ln units.
+            deviation /= max(float(np.mean(np.abs(target.values))), 1e-12)
 
-        losses = per_obs_losses(frame['pred_ln'], frame['pred_rv'],
-                                target.values, floor)
+        losses = per_obs_losses(frame['pred'], frame['pred_rv'],
+                                target.values, floor, log_mode)
         row = {'dataset': dataset, 'asset': meta['asset'], 'horizon': h,
-               'model': meta['model'], 'seed': meta.get('seed'),
+               'model': meta['model'], 'seed': meta.get('seed'), 'scale': scale,
                'n_obs': len(frame),
                'n_floored': int((frame['pred_rv'] <= 0).sum()),
                'target_dev': deviation}
@@ -133,7 +146,8 @@ def collect(results_dir):
         for key in ('bias', 'resid_var', 'val_loss', 'n_params', 'seconds'):
             row[key] = meta.get(key)
         rows.append(row)
-        blocks[(dataset, h)][(meta['model'], meta.get('seed'))] = (frame, losses)
+        blocks[(dataset, h)][(meta['model'], meta.get('seed'))] = Cell(
+            frame, losses, scale)
 
     return rows, blocks, floors, targets
 
@@ -175,28 +189,54 @@ def model_order(names):
     return known + sorted(n for n in names if n not in set(MODELS))
 
 
+def block_scale(dataset, h, cells):
+    """The one modelling scale of a block, or None if it holds more than one.
+
+    A ln(RV) cell and a raw one predict different objects (ln of the forward
+    mean vs the forward mean), so their MSE/MAE are in different units and the
+    block has no single set of actuals to write. They are still comparable on
+    the variance-scale losses, but that is a comparison to set up deliberately,
+    not something to fall into because two sweeps shared a directory.
+    """
+    scales = sorted({cell.scale for cell in cells.values()})
+    if len(scales) > 1:
+        print(f'[WARN] {dataset} h={h}: this block mixes {" and ".join(scales)} '
+              f'cells, so it has no single target. Run the raw-scale sweep into '
+              f'its own --results_dir; metrics.csv still carries every row, '
+              f'labelled by scale.')
+        return None
+    return scales[0]
+
+
+def shared_losses(cells):
+    """Loss columns present in every cell of a block, in LOSS_TO_METRIC order."""
+    keys = set.intersection(*(set(cell.losses) for cell in cells))
+    return [loss for loss in LOSS_TO_METRIC if loss in keys]
+
+
 def seedmean_members(cells):
-    """{model: (pred_ln, pred_rv, n_seeds)} — the repeats averaged into one forecast.
+    """{model: (pred, pred_rv, n_seeds)} — the repeats averaged into one forecast.
 
     Averaged on BOTH scales separately, because each loss is defined on one of
-    them: the ln-scale losses see the mean ln forecast, and QLIKE / the
-    variance-scale losses see the mean variance forecast, which is the
-    conditional mean they are minimised by. Passing one through exp() to get
-    the other would give the geometric mean of the repeats instead.
+    them: the modelling-scale losses see the mean modelling-scale forecast, and
+    QLIKE / the variance-scale losses see the mean variance forecast, which is
+    the conditional mean they are minimised by. Under --log, passing one
+    through exp() to get the other would give the geometric mean of the repeats
+    instead; in raw mode the two are the same average.
 
     HAR-RV is deterministic and has a single cell, so it passes through
     unchanged and stays comparable to the ensembles.
     """
     frames = defaultdict(list)
-    for (model, _), (frame, _) in cells.items():
-        frames[model].append(frame)
-    return {model: (np.mean([f['pred_ln'].values for f in group], axis=0),
+    for (model, _), cell in cells.items():
+        frames[model].append(cell.frame)
+    return {model: (np.mean([f['pred'].values for f in group], axis=0),
                     np.mean([f['pred_rv'].values for f in group], axis=0),
                     len(group))
             for model, group in frames.items()}
 
 
-def write_seedmean(results_dir, dataset, asset, h, cells, target, floor):
+def write_seedmean(results_dir, dataset, asset, h, cells, target, floor, scale):
     """The seed-averaged forecast and its loss matrices, plus its metric rows.
 
     With --itr 10 there are ten per-seed loss matrices per block and no
@@ -208,34 +248,48 @@ def write_seedmean(results_dir, dataset, asset, h, cells, target, floor):
     the ensemble reads better than any repeat. It is a different (and better)
     forecast, not a smoothed report of the same one.
     """
+    log_mode = is_log(scale)
     members = seedmean_members(cells)
     order = model_order(members)
     dates = target.index
     stem = f'{dataset}_h{h:02d}'
 
-    wide = pd.DataFrame(index=dates)
-    wide['y_ln'] = target.values
-    wide['y_rv'] = np.exp(target.values)
+    wide = target_columns(target, log_mode)
     losses, rows = {}, []
     for model in order:
-        pred_ln, pred_rv, n_seeds = members[model]
-        wide[f'{model}__ln'] = pred_ln
+        pred, pred_rv, n_seeds = members[model]
+        wide[f'{model}__pred'] = pred
         wide[f'{model}__rv'] = pred_rv
-        losses[model] = per_obs_losses(pred_ln, pred_rv, target.values, floor)
+        losses[model] = per_obs_losses(pred, pred_rv, target.values, floor,
+                                       log_mode)
         row = {'dataset': dataset, 'asset': asset, 'horizon': h,
-               'model': model, 'n_seeds': n_seeds, 'n_obs': len(dates)}
+               'model': model, 'scale': scale, 'n_seeds': n_seeds,
+               'n_obs': len(dates)}
         row.update(summarize_losses(losses[model]))
         rows.append(row)
     wide.to_csv(os.path.join(results_dir, 'forecasts', f'{stem}__seedmean.csv'))
 
-    for loss in LOSS_TO_METRIC:
+    for loss in (l for l in LOSS_TO_METRIC if l in losses[order[0]]):
         pd.DataFrame({model: losses[model][loss] for model in order},
                      index=dates, columns=order).to_csv(
             os.path.join(results_dir, 'losses', f'{stem}__{loss}__seedmean.csv'))
     return rows
 
 
-def write_block(results_dir, dataset, h, cells, target, complete):
+def target_columns(target, log_mode):
+    """The actuals frame every forecast file starts with, on both scales.
+
+    `y_pred_scale` is the actual on the scale the models were fitted on --
+    ln(RV) or RV -- and `y_rv` is always the variance, so the RV columns of a
+    raw file and a --log file hold the same numbers and can be set side by side.
+    """
+    wide = pd.DataFrame(index=target.index)
+    wide['y_pred_scale'] = target.values
+    wide['y_rv'] = np.exp(target.values) if log_mode else target.values
+    return wide
+
+
+def write_block(results_dir, dataset, h, cells, target, scale, complete):
     """Forecast and loss files for one (dataset, horizon) block, per seed."""
     forecasts_dir = os.path.join(results_dir, 'forecasts')
     losses_dir = os.path.join(results_dir, 'losses')
@@ -246,7 +300,7 @@ def write_block(results_dir, dataset, h, cells, target, complete):
     for seed in block_seeds(cells):
         # HAR-RV carries no seed and belongs in every seed's matrix: it is the
         # same baseline whatever the networks were initialised with.
-        members = {model: payload for (model, s), payload in cells.items()
+        members = {model: cell for (model, s), cell in cells.items()
                    if s == seed or s is None}
         if not members:
             continue
@@ -256,18 +310,15 @@ def write_block(results_dir, dataset, h, cells, target, complete):
         # how these are read: one loss, every dataset.
         suffix = '' if seed is None else f'__seed{seed}'
 
-        wide = pd.DataFrame(index=dates)
-        wide['y_ln'] = target.values
-        wide['y_rv'] = np.exp(target.values)
+        wide = target_columns(target, is_log(scale))
         for model in order:
-            frame, _ = members[model]
-            wide[f'{model}__ln'] = frame['pred_ln'].values
-            wide[f'{model}__rv'] = frame['pred_rv'].values
+            wide[f'{model}__pred'] = members[model].frame['pred'].values
+            wide[f'{model}__rv'] = members[model].frame['pred_rv'].values
         wide.to_csv(os.path.join(forecasts_dir, f'{stem}{suffix}.csv'))
 
-        for loss in LOSS_TO_METRIC:
+        for loss in shared_losses(members.values()):
             matrix = pd.DataFrame(
-                {model: members[model][1][loss] for model in order},
+                {model: members[model].losses[loss] for model in order},
                 index=dates, columns=order)
             matrix.to_csv(os.path.join(losses_dir,
                                        f'{stem}__{loss}{suffix}.csv'))
@@ -292,6 +343,12 @@ def write_tables(results_dir, rows, seedmean_rows=()):
                         index=False)
 
     frame = pd.DataFrame(rows)
+    # A raw-scale sweep produces no ln metrics at all, so the columns have to
+    # be created empty rather than assumed: one schema for both scales is what
+    # lets a raw table and a --log one be concatenated on the RV columns.
+    for column in METRIC_COLS + EXTRA_COLS:
+        if column not in frame:
+            frame[column] = np.nan
     # Nullable Int64: HAR-RV has no seed, and a plain int column with one
     # missing value would silently turn every seed into a float.
     frame['seed'] = frame['seed'].astype('Int64')
@@ -304,7 +361,7 @@ def write_tables(results_dir, rows, seedmean_rows=()):
 
     # Seed-averaged. std is the initialisation spread of the configuration and
     # is empty with one seed, which is the honest way to show it is unmeasured.
-    grouped = frame.groupby(['dataset', 'asset', 'horizon', 'model'],
+    grouped = frame.groupby(['dataset', 'asset', 'horizon', 'model', 'scale'],
                             observed=True)
     mean = grouped[METRIC_COLS].mean()
     std = grouped[METRIC_COLS].std(ddof=1)
@@ -313,34 +370,51 @@ def write_tables(results_dir, rows, seedmean_rows=()):
     summary = summary.reset_index().sort_values(['dataset', 'horizon', 'model'])
     summary.to_csv(os.path.join(tables_dir, 'metrics_mean.csv'), index=False)
 
+    # One pivot per (metric, horizon, scale). The scale enters the filename
+    # only when the directory holds more than one, so a normal single-scale
+    # sweep keeps the plain name -- and a directory holding both does not
+    # collapse two rows per model into one cell.
+    scales = list(summary['scale'].unique())
     for metric in METRIC_COLS:
-        for h in sorted(frame['horizon'].unique()):
-            part = summary[summary['horizon'] == h]
-            if part.empty:
+        for (h, scale), part in summary.groupby(['horizon', 'scale'],
+                                                observed=True):
+            # A raw-scale sweep has no ln metrics, and a pivot of nothing but
+            # empty cells is a file that only looks like a result.
+            if part.empty or part[metric].isna().all():
                 continue
             pivot = part.pivot(index='model', columns='dataset', values=metric)
             pivot = pivot.reindex(model_order(pivot.index))
-            pivot.to_csv(os.path.join(tables_dir, f'pivot_{metric}_h{h:02d}.csv'))
+            tag = '' if len(scales) == 1 else f'_{scale}'
+            pivot.to_csv(os.path.join(tables_dir,
+                                      f'pivot_{metric}{tag}_h{h:02d}.csv'))
     return frame, summary
 
 
 def print_summary(summary):
-    """A compact readout: mean over datasets, per model and horizon."""
+    """A compact readout: mean over datasets, per model, horizon and scale.
+
+    MSE/MAE are shown on the scale the models were fitted on, so a --log sweep
+    reads in ln(RV) as it always has and a raw one in variance units. Both are
+    averaged across datasets whose RV levels differ by an order of magnitude
+    between forex and crypto -- fine for a glance, not a ranking. The tables in
+    tables/ are per dataset for that reason.
+    """
     if summary.empty:
         return
-    for h in sorted(summary['horizon'].unique()):
-        part = summary[summary['horizon'] == h]
+    for (h, scale), part in summary.groupby(['horizon', 'scale'], observed=True):
+        mse, mae = ('MSE_ln', 'MAE_ln') if is_log(scale) else ('MSE_RV', 'MAE_RV')
         grouped = part.groupby('model', observed=True)
-        table = grouped[['MSE_ln', 'MAE_ln', 'QLIKE']].mean()
+        table = grouped[[mse, mae, 'QLIKE']].mean()
         table['n'] = grouped['dataset'].nunique()
         table = table.reindex(model_order(table.index)).dropna(how='all')
-        print(f"\n  h = {h}   mean over the datasets scored so far")
-        print(f"  {'model':<14} {'n':>3} {'MSE[ln]':>10} {'MAE[ln]':>10} "
-              f"{'QLIKE':>10}")
-        print('  ' + '-' * 50)
+        unit = 'ln' if is_log(scale) else 'RV'
+        print(f"\n  h = {h}  [{scale}]   mean over the datasets scored so far")
+        print(f"  {'model':<14} {'n':>3} {'MSE[' + unit + ']':>12} "
+              f"{'MAE[' + unit + ']':>12} {'QLIKE':>10}")
+        print('  ' + '-' * 54)
         for model, row in table.iterrows():
-            print(f"  {model:<14} {int(row['n']):>3} {row['MSE_ln']:>10.6f} "
-                  f"{row['MAE_ln']:>10.6f} {row['QLIKE']:>10.6f}")
+            print(f"  {model:<14} {int(row['n']):>3} {row[mse]:>12.6f} "
+                  f"{row[mae]:>12.6f} {row['QLIKE']:>10.6f}")
 
 
 # ---------------------------------------------------------------------------
@@ -354,21 +428,24 @@ def aggregate(results_dir=DEFAULT_RESULTS_DIR, strict=False, quiet=False):
     expected_models = set(MODELS)
     coverage, seedmean_rows = {}, []
     for (dataset, h), cells in sorted(blocks.items()):
-        target = targets[(dataset, h)]
+        scale = block_scale(dataset, h, cells)
+        if scale is None:
+            continue
+        target = targets[(dataset, h, scale)]
         dates = target.index
         present = {model for (model, _) in cells}
         missing = sorted(expected_models - present)
         coverage[f'{dataset}_h{h:02d}'] = {
-            'n_obs': int(len(dates)),
+            'n_obs': int(len(dates)), 'scale': scale,
             'first': str(dates[0].date()), 'last': str(dates[-1].date()),
             'models': sorted(present), 'missing': missing}
-        write_block(results_dir, dataset, h, cells, target, not missing)
+        write_block(results_dir, dataset, h, cells, target, scale, not missing)
         # One repeat is not an ensemble, and its seedmean files would only
         # duplicate the per-seed ones.
         if len(block_seeds(cells)) > 1:
             seedmean_rows += write_seedmean(
                 results_dir, dataset, dataset_spec(dataset).asset, h, cells,
-                target, floors[dataset])
+                target, floors[dataset], scale)
 
     frame, summary = write_tables(results_dir, rows, seedmean_rows)
 

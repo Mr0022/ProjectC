@@ -15,10 +15,17 @@ The grid
     h       1  5  22
 
 Every cell is run under the SAME protocol the hyper-parameter search used:
-``--aggregate_mean --log``, ``seq_len 96``, univariate ``RV``. The model
-forecasts one number, the h-day forward mean of RV on the ln scale, which is
-exactly HAR-RV's target Y^(h) -- so a deep model and the baseline are scored on
-identical rows against identical actuals.
+``--aggregate_mean``, ``seq_len 96``, univariate ``RV``. The model forecasts
+one number, the h-day forward mean of RV, which is exactly HAR-RV's target
+Y^(h) -- so a deep model and the baseline are scored on identical rows against
+identical actuals.
+
+The SCALE is whatever the anchor was tuned on: ``--log`` in its command line
+means the cell models ln(mean RV), its absence means the mean RV itself. Both
+are supported end to end -- the target, the Jensen correction (log only), the
+losses and HAR-RV's own invocation all follow the anchor -- and a sweep must
+be on one scale, which run_benchmark checks. exp() of the log target is the raw
+target exactly, so the two are still comparable on the variance-scale losses.
 
 Hyper-parameters
 ----------------
@@ -26,14 +33,13 @@ Taken verbatim from the Optuna winners in ``tuning/ProjectC_tuning`` --
 ``<Model>_best.json`` carries both the winning parameters and the full command
 line that produced them, and the command line is what is reused. Everything the
 orchestrator does not own (architecture, learning rate, batch size, schedule,
-``--aggregate_mean --log``) is passed through unchanged; the owned flags are
-listed in ``ORCHESTRATOR_FLAGS`` below.
+``--aggregate_mean``, ``--log``) is passed through unchanged; the owned flags
+are listed in ``ORCHESTRATOR_FLAGS`` below.
 
 Those studies were run on EUR/USD at h = 1 only, so applying them to the other
 nine datasets and to h = 5 / 22 is a transfer, not a per-cell tuning. It is the
-protocol the user asked for and it is the honest one for a cross-dataset
-comparison (every model gets the same treatment), but the transfer should be
-stated wherever the table is reported. Nothing about it is baked in: drop a
+honest protocol for a cross-dataset comparison -- every model gets the same
+treatment -- but the transfer should be stated wherever the table is reported. Nothing about it is baked in: drop a
 ``<anchor_dir>/<dataset>/<Model>_best.json`` in place and that dataset picks up
 its own anchor automatically (see ``anchor_path``).
 
@@ -101,8 +107,22 @@ DEFAULT_PATIENCE = 7
 
 # Same fraction HAR-RV_RUN.PY and Exp_Long_Term_Forecast use. Under --log every
 # forecast is exp(.) > 0, so the floor never binds; it is applied anyway so the
-# QLIKE written here is the same function of (forecast, actual) as theirs.
+# QLIKE written here is the same function of (forecast, actual) as theirs. On
+# the raw scale it does bind -- an unconstrained head can forecast a negative
+# variance -- and metrics.csv counts how often (`n_floored`).
 QLIKE_FLOOR_FRAC = 1e-4
+
+# The modelling scale of a cell, taken from whether its tuned command line
+# carries --log. It is a property of the ANCHOR, not a flag of the sweep: a
+# model has to be scored on the scale it was tuned and trained on, and mixing
+# the two within one comparison is what the check in run_benchmark prevents.
+LN_SCALE = 'ln_RV'
+RAW_SCALE = 'raw_RV'
+
+
+def is_log(scale):
+    return scale == LN_SCALE
+
 
 TARGET_COL = 'RV'
 DATE_COL = 'date'
@@ -187,16 +207,24 @@ def test_target_dates(spec, h, seq_len=SEQ_LEN, root_path=None):
                             name=DATE_COL)
 
 
-def horizon_target(spec, h, seq_len=SEQ_LEN, root_path=None):
-    """The actuals a cell is scored against: Y^(h) = ln(mean RV over t..t+h-1).
+def horizon_target(spec, h, log_mode=True, seq_len=SEQ_LEN, root_path=None):
+    """The actuals a cell is scored against.
+
+        --log     Y^(h) = ln( mean RV over t..t+h-1 )
+        raw       Y^(h) =     mean RV over t..t+h-1
+
+    exp() of the first is the second exactly -- the log sits outside the mean
+    on both sides -- which is what lets a raw-scale run and a --log run be
+    compared on the variance-scale losses at every horizon.
 
     Derived here, in float64, from the CSV -- independently of both families.
-    HAR-RV builds it as ``rolling(h).mean().shift(-(h-1))`` then ``log``;
-    Exp_Long_Term_Forecast builds it as ``logsumexp(ln RV) - ln(h)`` over the
-    future window after undoing the loader's standardisation. Those are the
-    same quantity by algebra, and this is the third computation that says so:
-    ``aggregate_results.py`` checks every stored cell against it, which is what
-    turns "the two families forecast the same target" from a claim into a test.
+    HAR-RV builds it as ``rolling(h).mean().shift(-(h-1))``, logged under
+    ``--log``; Exp_Long_Term_Forecast builds it as the mean over the future
+    window, or ``logsumexp(ln RV) - ln(h)``, after undoing the loader's
+    standardisation. Those are the same quantity by algebra, and this is the
+    third computation that says so: ``aggregate_results.py`` checks every
+    stored cell against it, which is what turns "the two families forecast the
+    same target" from a claim into a test.
 
     Scoring against one reference series rather than each cell's own copy also
     keeps the loss differentials clean: a deep model's actuals have been
@@ -208,7 +236,8 @@ def horizon_target(spec, h, seq_len=SEQ_LEN, root_path=None):
     """
     df = read_rv_series(spec, root_path)
     forward = df[TARGET_COL].rolling(h).mean().shift(-(h - 1))
-    series = pd.Series(np.log(forward.values), name='y_ln',
+    values = np.log(forward.values) if log_mode else forward.values
+    series = pd.Series(values, name='y_ln' if log_mode else 'y_rv',
                        index=pd.DatetimeIndex(df[DATE_COL].values, name=DATE_COL))
     return series.reindex(test_target_dates(spec, h, seq_len, root_path))
 
@@ -239,7 +268,7 @@ def qlike_floor(spec, root_path=None):
 # Losses -- one definition, used for every model
 # ---------------------------------------------------------------------------
 
-def per_obs_losses(pred_ln, pred_rv, true_ln, floor):
+def per_obs_losses(pred, pred_rv, target, floor, log_mode=True):
     """Per-observation losses for one cell, as flat arrays of equal length.
 
     Reproduces utils.metrics.QLIKE and HAR-RV_RUN.PY's mse/mae/qlike exactly,
@@ -247,45 +276,64 @@ def per_obs_losses(pred_ln, pred_rv, true_ln, floor):
     is what Diebold-Mariano and the MCS consume, and the mean of each column is
     the headline metric, so the table and the tests cannot disagree.
 
-        se_ln / ae_ln  squared / absolute error in ln(RV), the scale the
-                       networks are trained on and HAR-RV --log is fitted on
-        se_rv / ae_rv  the same errors after the back-transform, on the
-                       variance scale, comparable across scales and horizons
-        qlike          RV/RV_hat - ln(RV/RV_hat) - 1  (Patton, 2011), a
-                       variance loss, hence computed on the back-transformed
-                       forecast
+    `pred` and `target` are on the MODELLING scale, `pred_rv` is the forecast
+    as a variance -- the Jensen back-transform under --log, the forecast itself
+    in raw mode.
+
+        se_ln / ae_ln  squared / absolute error in ln(RV). LOG MODE ONLY: in
+                       raw mode a forecast can be <= 0, where the log does not
+                       exist, so these keys are simply absent
+        se_rv / ae_rv  the same errors on the variance scale. Comparable
+                       between a raw run and a --log one -- exp() of the log
+                       target is the raw target exactly, at every horizon
+        qlike          RV/RV_hat - ln(RV/RV_hat) - 1  (Patton, 2011)
+
+    Two rules for the non-positive forecasts only a raw-scale model can
+    produce, both taken from HAR-RV_RUN.PY's raw branch and
+    Exp_Long_Term_Forecast.test() so the three agree number for number:
+
+      * MSE/MAE are measured against max(forecast, 0) -- a negative variance is
+        not admissible, so zero is the best feasible prediction the model could
+        have issued;
+      * QLIKE is infinite at zero and floors them at `floor` instead.
+
+    Both are inert under --log, where the forecast is exp(.) > 0.
 
     QLIKE is asymmetric in its argument order: the ratio is actual/forecast,
     and inverting it is a different loss, not a rescaling of the same one.
     """
-    pred_ln = np.asarray(pred_ln, dtype=float).reshape(-1)
+    pred = np.asarray(pred, dtype=float).reshape(-1)
     pred_rv = np.asarray(pred_rv, dtype=float).reshape(-1)
-    true_ln = np.asarray(true_ln, dtype=float).reshape(-1)
-    true_rv = np.exp(true_ln)
+    target = np.asarray(target, dtype=float).reshape(-1)
+    true_rv = np.exp(target) if log_mode else target
 
-    err_ln = true_ln - pred_ln
-    err_rv = true_rv - pred_rv
-    safe = np.where(pred_rv <= 0, floor, pred_rv)
-    ratio = true_rv / safe
-    return {
-        'se_ln': err_ln ** 2,
-        'ae_ln': np.abs(err_ln),
-        'se_rv': err_rv ** 2,
-        'ae_rv': np.abs(err_rv),
-        'qlike': ratio - np.log(ratio) - 1.0,
-    }
+    losses = {}
+    if log_mode:
+        err = target - pred
+        losses['se_ln'] = err ** 2
+        losses['ae_ln'] = np.abs(err)
+
+    err_rv = true_rv - np.maximum(pred_rv, 0.0)
+    ratio = true_rv / np.where(pred_rv <= 0, floor, pred_rv)
+    losses['qlike'] = ratio - np.log(ratio) - 1.0
+    losses['se_rv'] = err_rv ** 2
+    losses['ae_rv'] = np.abs(err_rv)
+    return losses
 
 
-# Loss column -> the metric its mean is reported as.
+# Loss column -> the metric its mean is reported as. A raw-scale cell has no
+# ln-scale losses, so those two metrics stay empty for it; the columns are kept
+# in the table either way, so a raw run and a --log run share one schema and can
+# be compared on the RV rows.
 LOSS_TO_METRIC = OrderedDict([('se_ln', 'MSE_ln'), ('ae_ln', 'MAE_ln'),
                               ('qlike', 'QLIKE'),
                               ('se_rv', 'MSE_RV'), ('ae_rv', 'MAE_RV')])
 
 
 def summarize_losses(losses):
-    """{loss column: array} -> {metric name: mean}."""
+    """{loss column: array} -> {metric name: mean}, skipping absent losses."""
     return {metric: float(np.mean(losses[key]))
-            for key, metric in LOSS_TO_METRIC.items()}
+            for key, metric in LOSS_TO_METRIC.items() if key in losses}
 
 
 # ---------------------------------------------------------------------------
@@ -373,13 +421,13 @@ def load_anchor(model, anchor_dir=None, dataset=None):
             f'a comparison of architectures; if the protocol really changed, '
             f'change SEQ_LEN in orchestrate/benchmark_config.py so the test '
             f'window is derived for the same value.')
-    for required in ('aggregate_mean', 'log'):
-        if required not in flags:
-            raise ValueError(
-                f'{path}: the tuned command line is missing --{required}. The '
-                f'benchmark scores the HAR-RV target on the ln(RV) scale and '
-                f'cannot use an anchor tuned on a different target.')
+    if 'aggregate_mean' not in flags:
+        raise ValueError(
+            f'{path}: the tuned command line is missing --aggregate_mean, so '
+            f'its target is a pred_len-step window rather than the h-day mean '
+            f'HAR-RV forecasts. The benchmark has nothing to compare it to.')
     return flags, {'path': path,
+                   'scale': LN_SCALE if 'log' in flags else RAW_SCALE,
                    'best_val_loss': best.get('best_val_loss'),
                    'best_params': best.get('best_params', {})}
 
@@ -448,14 +496,24 @@ def cell_path(results_dir, dataset, h, model, seed=None):
     return os.path.join(results_dir, 'runs', dataset, f'h{h:02d}', f'{stem}.npz')
 
 
-def save_cell(path, pred_ln, pred_rv, true_ln, dates, meta):
+def save_cell(path, pred, pred_rv, true, dates, meta):
     """Write one cell's forecasts.
 
+    `pred` and `true` are on the modelling scale (ln(RV) under --log, RV
+    otherwise); `pred_rv` is the forecast as a variance -- the Jensen
+    back-transform under --log, and `pred` itself in raw mode.
+
     Both scales are stored rather than one plus a rule for recovering the
-    other: the ln forecast is what the model produced, the variance forecast is
-    what QLIKE is defined on, and the Jensen terms that connect them are part
-    of the fitted model. Storing all three means the scoring code applies no
-    model-specific correction of its own.
+    other: the modelling-scale forecast is what the model produced, the
+    variance forecast is what QLIKE is defined on, and the Jensen terms that
+    connect them are part of the fitted model. Storing all three means the
+    scoring code applies no model-specific correction of its own -- and
+    `meta['scale']` says which is which.
+
+    Raw-scale forecasts are stored UNCLIPPED, exactly as the model issued them.
+    The clip at zero is a property of the loss, not of the forecast, and
+    per_obs_losses applies it; storing clipped values would hide how far
+    negative a model went.
 
     Written to a temporary file and renamed, so the cell either exists in full
     or does not exist at all. A sweep is expected to be interrupted, and the
@@ -465,9 +523,9 @@ def save_cell(path, pred_ln, pred_rv, true_ln, dates, meta):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = f'{path}.tmp'
     np.savez(tmp,
-             pred_ln=np.asarray(pred_ln, dtype=float),
+             pred=np.asarray(pred, dtype=float),
              pred_rv=np.asarray(pred_rv, dtype=float),
-             true_ln=np.asarray(true_ln, dtype=float),
+             true=np.asarray(true, dtype=float),
              dates=np.asarray([str(d) for d in
                                pd.DatetimeIndex(dates).strftime('%Y-%m-%d')]),
              meta=json.dumps(meta, sort_keys=True))
@@ -476,11 +534,19 @@ def save_cell(path, pred_ln, pred_rv, true_ln, dates, meta):
 
 
 def load_cell(path):
-    """Read one cell back as (DataFrame indexed by date, meta dict)."""
+    """Read one cell back as (DataFrame indexed by date, meta dict).
+
+    Cells written before the raw scale existed name their columns pred_ln /
+    true_ln and carry no 'scale'; they were all ln(RV), so they are read under
+    the current names with that scale filled in rather than being re-run.
+    """
     with np.load(path, allow_pickle=False) as data:
+        legacy = 'pred_ln' in data
         frame = pd.DataFrame(
-            {'pred_ln': data['pred_ln'], 'pred_rv': data['pred_rv'],
-             'true_ln': data['true_ln']},
+            {'pred': data['pred_ln' if legacy else 'pred'],
+             'pred_rv': data['pred_rv'],
+             'true': data['true_ln' if legacy else 'true']},
             index=pd.DatetimeIndex(pd.to_datetime(data['dates']), name=DATE_COL))
         meta = json.loads(str(data['meta']))
+    meta.setdefault('scale', LN_SCALE)
     return frame, meta

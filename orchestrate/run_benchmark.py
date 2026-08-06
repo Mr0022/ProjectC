@@ -5,10 +5,14 @@
 
 Each deep-model cell is trained with the hyper-parameters Optuna selected for
 that model (``tuning/ProjectC_tuning/<Model>_best.json``) under the protocol
-those studies used -- ``--aggregate_mean --log``, ``seq_len 96``, univariate RV
--- so the target is HAR-RV's Y^(h) on the ln(RV) scale and the baseline is
-scored on identical rows against identical actuals. HAR-RV itself is fitted by
-``HAR-RV_RUN.PY --log``, unmodified.
+those studies used -- ``--aggregate_mean``, ``seq_len 96``, univariate RV -- so
+the target is HAR-RV's Y^(h) and the baseline is scored on identical rows
+against identical actuals. HAR-RV itself is fitted by ``HAR-RV_RUN.PY``,
+unmodified.
+
+The modelling scale comes from the anchors: a tuned command line carrying
+``--log`` makes the cell ln(RV), one without it raw RV, and HAR-RV is fitted on
+whichever scale the sweep is on. One scale per sweep -- see resolve_scale.
 
     python orchestrate/run_benchmark.py                      # the whole grid
     python orchestrate/run_benchmark.py --dry_run            # print the plan
@@ -21,9 +25,10 @@ scored on identical rows against identical actuals. HAR-RV itself is fitted by
 What a cell writes
 ------------------
 ``<results_dir>/runs/<dataset>/h<hh>/<Model>_seed<seed>.npz`` holding the
-per-observation test forecasts -- ``pred_ln`` (what the model produced),
-``pred_rv`` (the lognormal back-transform, which is what QLIKE is defined on),
-``true_ln``, and the target dates. Metrics are NOT computed here: they are
+per-observation test forecasts -- ``pred`` (what the model produced, on its
+modelling scale), ``pred_rv`` (the same forecast as a variance, which is what
+QLIKE is defined on: the lognormal back-transform under ``--log``, ``pred``
+itself in raw mode), ``true``, and the target dates. Metrics are NOT here: they are
 means of per-observation losses, and Diebold-Mariano and the MCS need the terms
 rather than the means, so both come from the same file in
 ``aggregate_results.py``. That is also why the forecasts, not the losses, are
@@ -69,8 +74,9 @@ import pandas as pd  # noqa: E402
 from orchestrate.benchmark_config import (  # noqa: E402
     DEEP_MODELS, DEFAULT_ANCHOR_DIR, DEFAULT_N_SEEDS, DEFAULT_PATIENCE,
     DEFAULT_RESULTS_DIR, DEFAULT_SEED, DEFAULT_TRAIN_EPOCHS, HAR_MODEL,
-    HORIZONS, anchor_argv, cell_id, cell_path, dataset_names, dataset_spec,
-    discover_anchors, save_cell, seed_list, test_target_dates)
+    HORIZONS, LN_SCALE, RAW_SCALE, anchor_argv, cell_id, cell_path,
+    dataset_names, dataset_spec, discover_anchors, is_log, load_anchor,
+    save_cell, seed_list, test_target_dates)
 
 FAILURE_FIELDS = ['dataset', 'horizon', 'model', 'seed', 'when', 'why']
 
@@ -92,10 +98,12 @@ def train_cell(model, spec, h, seed, args):
 
       * validation, for the selection metric of the checkpoint that was kept;
       * test, for the forecasts this benchmark is about;
-      * train, for the Jensen correction. exp(.) of a log-scale forecast is the
-        conditional MEDIAN; the mean needs exp(bias + sigma^2/2) with both
-        terms measured on TRAINING residuals -- test residuals would leak the
-        out-of-sample outcome into the forecast.
+      * train, for the Jensen correction -- UNDER --log ONLY. exp(.) of a
+        log-scale forecast is the conditional MEDIAN; the mean needs
+        exp(bias + sigma^2/2) with both terms measured on TRAINING residuals,
+        since test residuals would leak the out-of-sample outcome into the
+        forecast. A raw-scale model forecasts the variance directly, so there
+        is nothing to correct and the pass is skipped.
 
     The training pass is sequential and keeps the last partial batch, unlike
     the loader used for optimisation: the correction is part of the forecast
@@ -119,6 +127,7 @@ def train_cell(model, spec, h, seed, args):
     parsed = run_module.build_parser().parse_args(argv)
     run_module.finalize_args(parsed)
     run_module.set_seed(seed)
+    log_mode = is_log(anchor_meta['scale'])
 
     started = time.time()
     exp = Exp_Long_Term_Forecast(parsed)
@@ -140,29 +149,33 @@ def train_cell(model, spec, h, seed, args):
         val_loss = float(np.mean((val_true - val_pred) ** 2))
 
         _, test_loader = exp._get_data(flag='test')
-        pred_ln, true_ln = exp._forward_collect(test_loader)
+        pred, true = exp._forward_collect(test_loader)
 
-        train_data, _ = exp._get_data(flag='train')
-        tr_pred, tr_true = exp._forward_collect(sequential(train_data))
+        bias, resid_var = 0.0, 0.0
+        if log_mode:
+            train_data, _ = exp._get_data(flag='train')
+            tr_pred, tr_true = exp._forward_collect(sequential(train_data))
+            resid = tr_true - tr_pred
+            bias, resid_var = float(resid.mean()), float(resid.var(ddof=1))
     finally:
         if not args.keep_checkpoints:
             shutil.rmtree(checkpoints, ignore_errors=True)
 
-    resid = tr_true - tr_pred
-    bias, resid_var = float(resid.mean()), float(resid.var(ddof=1))
-    pred_rv = lognormal_back_transform(pred_ln, resid_var, bias)
+    pred_rv = lognormal_back_transform(pred, resid_var, bias) if log_mode else pred
 
     dates = test_target_dates(spec, h)
-    if len(dates) != len(pred_ln):
+    if len(dates) != len(pred):
         raise RuntimeError(
-            f'{name}: the test loader emitted {len(pred_ln)} forecast(s) but '
+            f'{name}: the test loader emitted {len(pred)} forecast(s) but '
             f'the {spec.asset} calendar puts {len(dates)} target window(s) in '
             f'the test split. The two are computed independently and must '
             f'agree, or the forecasts cannot be aligned across models.')
 
     meta = {
         'model': model, 'dataset': spec.name, 'asset': spec.asset,
-        'horizon': h, 'seed': seed, 'n_obs': int(len(pred_ln)),
+        'horizon': h, 'seed': seed, 'n_obs': int(len(pred)),
+        'scale': anchor_meta['scale'],
+        'n_negative': int((pred_rv < 0).sum()),
         'bias': bias, 'resid_var': resid_var, 'val_loss': val_loss,
         'seconds': round(time.time() - started, 1),
         'n_params': int(sum(p.numel() for p in exp.model.parameters())),
@@ -173,15 +186,15 @@ def train_cell(model, spec, h, seed, args):
         'torch': torch.__version__,
         'device': str(exp.device),
     }
-    return pred_ln, pred_rv, true_ln, dates, meta
+    return pred, pred_rv, true, dates, meta
 
 
 def run_worker(args):
     """``--worker``: train exactly one cell and write its .npz. One per process."""
     spec = dataset_spec(args.dataset)
-    pred_ln, pred_rv, true_ln, dates, meta = train_cell(
+    pred, pred_rv, true, dates, meta = train_cell(
         args.model, spec, args.horizon, args.seed, args)
-    save_cell(args.out, pred_ln, pred_rv, true_ln, dates, meta)
+    save_cell(args.out, pred, pred_rv, true, dates, meta)
     print(f"[worker] wrote {args.out}  n={meta['n_obs']}  "
           f"val_loss={meta['val_loss']:.6f}  {meta['seconds']:.0f}s", flush=True)
 
@@ -210,17 +223,24 @@ def har_outdir(results_dir, dataset):
     return os.path.join(results_dir, 'har', dataset)
 
 
-def convert_har(spec, h, results_dir):
+def convert_har(spec, h, results_dir, scale):
     """Fold one horizon of a HAR-RV run into the same .npz format as a cell.
 
-    HAR-RV_RUN.PY --log exports, per horizon, the fitted values for both splits
-    with the back-transformed variance forecast alongside; the test rows of
-    that file are the baseline's forecasts. Nothing is recomputed here -- the
-    columns are read as they were written, so the baseline in this benchmark is
-    the baseline that script reports.
+    HAR-RV_RUN.PY exports, per horizon, the fitted values for both splits; the
+    test rows of that file are the baseline's forecasts. Nothing is recomputed
+    here -- the columns are read as they were written, so the baseline in this
+    benchmark is the baseline that script reports.
+
+    Under --log the export carries the back-transformed variance forecast
+    alongside, and the files are named har_rv_log_*. A raw-scale fit forecasts
+    the variance directly, so `fitted` IS the variance forecast -- negative
+    values included, which is exactly what the raw scale can produce and what
+    the QLIKE floor and the MSE/MAE clip in per_obs_losses exist for.
     """
+    log_mode = is_log(scale)
+    prefix = 'har_rv_log' if log_mode else 'har_rv'
     path = os.path.join(har_outdir(results_dir, spec.name),
-                        f'har_rv_log_h{h:02d}_fitted.csv')
+                        f'{prefix}_h{h:02d}_fitted.csv')
     if not os.path.isfile(path):
         raise FileNotFoundError(
             f'{spec.name} h={h}: HAR-RV wrote no {os.path.basename(path)}. '
@@ -238,19 +258,25 @@ def convert_har(spec, h, results_dir):
             f'models and HAR-RV must forecast the same dates, or the DM and '
             f'MCS tests compare different samples.')
 
-    # sigma^2 back out of fitted_RV = exp(fitted + sigma^2/2); the export does
-    # not carry it, and it belongs in the record next to the deep models'.
-    resid_var = float(np.mean(2.0 * (np.log(test['fitted_RV'].values)
-                                     - test['fitted'].values)))
+    if log_mode:
+        # sigma^2 back out of fitted_RV = exp(fitted + sigma^2/2); the export
+        # does not carry it, and it belongs in the record next to the deep
+        # models'.
+        pred_rv = test['fitted_RV'].values
+        resid_var = float(np.mean(2.0 * (np.log(pred_rv)
+                                         - test['fitted'].values)))
+    else:
+        pred_rv, resid_var = test['fitted'].values, 0.0
+
     meta = {'model': HAR_MODEL, 'dataset': spec.name, 'asset': spec.asset,
             'horizon': h, 'seed': None, 'n_obs': int(len(test)),
+            'scale': scale, 'n_negative': int((pred_rv < 0).sum()),
             'bias': 0.0, 'resid_var': resid_var,
             'command': f'python -u HAR-RV_RUN.PY --data data/{spec.data_path} '
-                       f'--asset {spec.asset} --log',
+                       f'--asset {spec.asset}' + (' --log' if log_mode else ''),
             'source': os.path.relpath(path, REPO_ROOT)}
     save_cell(cell_path(results_dir, spec.name, h, HAR_MODEL),
-              test['fitted'].values, test['fitted_RV'].values,
-              test['Y_h'].values, dates, meta)
+              test['fitted'].values, pred_rv, test['Y_h'].values, dates, meta)
     return meta
 
 
@@ -259,8 +285,10 @@ def run_har(spec, args):
     outdir = har_outdir(args.results_dir, spec.name)
     cmd = [sys.executable, '-u', 'HAR-RV_RUN.PY',
            '--data', os.path.join('data', spec.data_path),
-           '--asset', spec.asset, '--log', '--outdir', outdir]
-    print(f"\n{'=' * 72}\n[HAR-RV] {spec.name} ({spec.asset})\n"
+           '--asset', spec.asset, '--outdir', outdir]
+    if is_log(args.scale):
+        cmd.append('--log')
+    print(f"\n{'=' * 72}\n[HAR-RV] {spec.name} ({spec.asset}) [{args.scale}]\n"
           f"{' '.join(cmd)}\n{'=' * 72}", flush=True)
     if args.dry_run:
         return True
@@ -272,9 +300,11 @@ def run_har(spec, args):
               f'stderr:\n{proc.stderr[-1500:]}', flush=True)
         return False
     for h in args.horizons:
-        meta = convert_har(spec, h, args.results_dir)
-        print(f"[OK] HAR-RV {spec.name} h={h}: {meta['n_obs']} forecast(s)",
-              flush=True)
+        meta = convert_har(spec, h, args.results_dir, args.scale)
+        negative = (f", {meta['n_negative']} negative" if meta['n_negative']
+                    else '')
+        print(f"[OK] HAR-RV {spec.name} h={h}: {meta['n_obs']} forecast(s)"
+              f"{negative}", flush=True)
     return True
 
 
@@ -406,6 +436,46 @@ def validate(args):
 # main
 # ---------------------------------------------------------------------------
 
+def resolve_scale(args, parser):
+    """The modelling scale of the sweep, and the check that it is one scale.
+
+    A model is scored on the scale it was tuned and trained on, so the scale is
+    read from the anchors rather than chosen here -- an anchor whose command
+    line carries --log is ln(RV), one without it is raw RV. Mixing the two
+    inside a comparison would put MSE/MAE in different units in the same table
+    (the variance-scale losses would still line up, but nothing else would), so
+    it is refused.
+
+    --scale exists for a HAR-RV-only run, which has no anchor to read, and as a
+    way to say out loud which scale a sweep is expected to be on; it must agree
+    with the anchors when there are any.
+    """
+    scales = {}
+    for model in args.deep_models:
+        for dataset in args.datasets:
+            _, meta = load_anchor(model, args.anchor_dir, dataset)
+            scales.setdefault(meta['scale'], []).append(f'{model}/{dataset}')
+
+    if len(scales) > 1:
+        detail = '; '.join(f'{scale}: {", ".join(sorted(set(who))[:4])}'
+                           + (' ...' if len(set(who)) > 4 else '')
+                           for scale, who in sorted(scales.items()))
+        parser.error(
+            f'the anchors mix modelling scales ({detail}). One scale per '
+            f'sweep: run the ln(RV) models and the raw ones separately, into '
+            f'separate --results_dir, or the same table would carry MSE in two '
+            f'different units.')
+
+    derived = next(iter(scales), None)
+    if args.scale is None:
+        args.scale = derived or LN_SCALE
+    elif derived and args.scale != derived:
+        parser.error(f'--scale says {args.scale} but the anchors in '
+                     f'{args.anchor_dir} are {derived}. The scale comes from '
+                     f'how a model was tuned; drop --scale, or point '
+                     f'--anchor_dir at the {args.scale} study.')
+
+
 def resolve_device(args, parser):
     """Fall back to CPU when there is no CUDA device, loudly.
 
@@ -456,6 +526,13 @@ def main(argv=None):
     ap.add_argument('--seeds', nargs='+', type=int, default=None,
                     metavar='SEED',
                     help='explicit seed list, overriding --itr/--seed')
+    ap.add_argument('--scale', choices=[LN_SCALE, RAW_SCALE], default=None,
+                    help='modelling scale of the sweep. Normally left alone: '
+                         'it is read from the anchors (--log in the tuned '
+                         'command line means ln_RV, its absence raw_RV) and '
+                         'must agree with them. Needed only for a HAR-RV-only '
+                         'run, which has no anchor to read; defaults to '
+                         f'{LN_SCALE} there')
     ap.add_argument('--train_epochs', type=int, default=DEFAULT_TRAIN_EPOCHS)
     ap.add_argument('--patience', type=int, default=DEFAULT_PATIENCE)
     ap.add_argument('--checkpoint_dir', default='./checkpoints/benchmark',
@@ -534,6 +611,8 @@ def main(argv=None):
               f'{", ".join(missing)}; those models are skipped. Tune them '
               f'first (tuning/optuna_tune.py) or drop the JSON in place.')
 
+    resolve_scale(args, ap)
+
     if args.validate:
         validate(args)                          # always CPU, no device to pick
         return 0
@@ -546,6 +625,8 @@ def main(argv=None):
     print(f'\nBenchmark plan  ({args.results_dir})')
     print(f'  datasets  : {len(args.datasets)}  [{", ".join(args.datasets)}]')
     print(f'  horizons  : {", ".join(str(h) for h in args.horizons)}')
+    print(f'  scale     : {args.scale}'
+          + ('  (from the anchors)' if args.deep_models else ''))
     print(f'  models    : {len(args.deep_models)} deep'
           + (f' + {HAR_MODEL}' if HAR_MODEL in args.models else '')
           + f'  [{", ".join(args.deep_models)}]')
