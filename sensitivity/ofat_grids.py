@@ -1,4 +1,4 @@
-"""OFAT sweep grids for the eleven long-term forecasters.
+"""OFAT sweep grids for the ten long-term forecasters.
 
 This is the sensitivity twin of ``tuning/search_spaces.py``: where that file
 says what Optuna was allowed to SEARCH, this one says what a one-factor-at-a-
@@ -22,8 +22,8 @@ Two differences follow from the change of purpose.
    covers exactly the ratios that were searched.
 
 2. **Continuous knobs get an evenly spaced grid across the searched range**
-   -- linear for the ones drawn linearly (``dropout``, ``propalpha``,
-   ``period_coeff``), logarithmic for the ones drawn on a log scale
+   -- linear for the ones drawn linearly (``dropout``, ``propalpha``),
+   logarithmic for the ones drawn on a log scale
    (``learning_rate``, ``regu_details``, ``regu_approx``). A sweep needs points
    it can plot; the ranges themselves are unchanged.
 
@@ -92,7 +92,6 @@ KIND = {
     'dropout': 'linear',
     'head_dropout': 'linear',
     'propalpha': 'linear',
-    'period_coeff': 'linear',
     'lradj': 'nominal',
     'activation': 'nominal',
     'down_sampling_method': 'nominal',
@@ -220,19 +219,6 @@ def _fits(a):
     return [('cut_freq', [3, 6, 12, 24, 36, 49])]
 
 
-def _wftnet(a):
-    return [
-        ('d_model', [16, 32, 64]),
-        ('d_ff', _d_ff(a)),
-        ('e_layers', [1, 2]),
-        ('top_k', [2, 3, 5]),
-        ('num_kernels', [3, 4, 6]),
-        ('wavelet_scale', [3, 4, 5, 6]),
-        ('period_coeff', [0.1, 0.3, 0.5, 0.7, 0.9]),
-        ('dropout', DROPOUT),
-    ]
-
-
 def _tslanet(a):
     return [
         ('d_model', [32, 64, 128]),
@@ -283,7 +269,6 @@ _SPECIFIC = {
     'MSGNet': _msgnet,
     'TimeMixer': _timemixer,
     'FITS': _fits,
-    'WFTNet': _wftnet,
     'TSLANet': _tslanet,
     'ModernTCN': _moderntcn,
     'AdaWaveNet': _adawavenet,

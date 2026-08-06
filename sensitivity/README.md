@@ -122,8 +122,7 @@ plot on top of each other. That trims 11 of 254 points.
 | **total (9 tuned models)** | | **243** | **1 215** |
 
 `--dry_run` prints the exact plan and every command without training anything.
-`TimesNet` and `WFTNet` join the table as soon as their `_best.json` files
-exist.
+`TimesNet` joins the table as soon as its `_best.json` file exists.
 
 ## 4. Coupled knobs and clamps
 
@@ -245,5 +244,4 @@ the anchors and the sweeps stay together.
 Drop its `<Model>_best.json` (the file `tuning/optuna_tune.py` writes) into
 `--results_dir` and re-run. The runner picks it up, reads the anchor and the
 base command out of it, and builds the grid from `ofat_grids.py` — where all
-eleven models already have one, including `TimesNet` and `WFTNet`. Nothing else
-needs editing.
+ten models already have one, including `TimesNet`. Nothing else needs editing.

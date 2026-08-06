@@ -1,11 +1,11 @@
-# Optuna hyper-parameter search — 11 deep models, `seq_len = 96`, `pred_len = 1`
+# Optuna hyper-parameter search — 10 deep models, `seq_len = 96`, `pred_len = 1`
 
-Search spaces and an Optuna driver for the eleven long-term forecasters in
+Search spaces and an Optuna driver for the ten long-term forecasters in
 `models/`, calibrated for the shipped EUR/USD realized-variance series.
 
 ```bash
 python tuning/optuna_tune.py --model DLinear                       # one model, 50 trials
-python tuning/optuna_tune.py --model all --retrain_best            # all eleven, then --itr 5
+python tuning/optuna_tune.py --model all --retrain_best            # all ten, then --itr 5
 ```
 
 On Colab, open `tuning/colab_tune.ipynb` (see §7).
@@ -29,7 +29,7 @@ are reported on resume so the count is not a mystery.
 |---|---|---|
 | `seq_len` | **96** | look-back window, ~4.5 months of business days |
 | `pred_len` | **1** | one-step-ahead |
-| `label_len` | 48 | decoder start token; none of the eleven has a real decoder, so it only sizes the unused `dec_inp` |
+| `label_len` | 48 | decoder start token; none of the ten has a real decoder, so it only sizes the unused `dec_inp` |
 | `features` / `enc_in` | `S` / 1 | univariate `RV` |
 | `train_epochs` / `patience` | 30 / **7** | early stopping, not epoch count, controls capacity. Patience 7 lets a configuration sit flat for several epochs and still recover, which happens on a split this noisy |
 | repeats per trial | **3** (`--n_seeds`, alias `--itr`) | each configuration is trained 3× (seeds 2021–2023) and scored by the **mean** |
@@ -43,9 +43,9 @@ numbers are comparable across models *and* against `HAR-RV_RUN.PY --log`.
 Splits are chronological and fixed by the loader: train ≤ 2022, validation
 2023–2024 (519 windows), test 2025+ (402 windows).
 
-## 2. Shared across all eleven
+## 2. Shared across all ten
 
-Identical for all eleven — no model gets a range another one lacks, so the
+Identical for all ten — no model gets a range another one lacks, so the
 resulting table compares architectures rather than search effort.
 
 | Parameter | Range | Why |
@@ -177,19 +177,7 @@ days, `24` everything slower than 4 days, `49` keeps all of it. Since the model
 the bandwidth and the parameter count — hence a dense integer range rather
 than a coarse grid.
 
-### 8. WFTNet
-| Parameter | Range | Note |
-|---|---|---|
-| `d_model` | {16, 32, 64} | TimesNet's Inception backbone plus a CWT branch |
-| `d_ff_mult` | {1, 2, 4} | |
-| `e_layers` | {1, 2} | |
-| `top_k` | {2, 3, 5} | |
-| `num_kernels` | {3, 4, 6} | |
-| `wavelet_scale` | {3, 4, 5, 6} | Morlet scales are `2**linspace(-1, scale, 8)`: scale 3 spans ~0.7–8 days, scale 6 spans ~0.7–64. The *count* (8) is hard-wired by the `(8,1)` convolution; only the span is tunable |
-| `period_coeff` | 0.1 – 0.9 | wavelet-vs-Fourier weight — the knob most worth trials. Volatility is bursty rather than globally periodic, so expect an optimum below 0.5 |
-| `dropout` | 0.0 – 0.3 | |
-
-### 9. TSLANet — reads exactly four fields
+### 8. TSLANet — reads exactly four fields
 | Parameter | Range | Note |
 |---|---|---|
 | `d_model` | {32, 64, 128} | patch embedding width |
@@ -200,7 +188,7 @@ than a coarse grid.
 The head is `Linear(d_model × num_patches → 1)`, so `d_model` and `patch_size`
 jointly dominate the parameter count.
 
-### 10. ModernTCN
+### 9. ModernTCN
 | Parameter | Range | Note |
 |---|---|---|
 | `d_model` | {16, 32, 64} | |
@@ -225,7 +213,7 @@ Three constraints, all handled by clamping:
 head is built for the pre-downsampling patch count, so a second stage would
 halve the feature axis and mismatch it.
 
-### 11. AdaWaveNet
+### 10. AdaWaveNet
 | Parameter | Range | Note |
 |---|---|---|
 | `d_model` | {16, 32, 64} | |
@@ -260,7 +248,6 @@ indicative ranking.
 | FITS | 564 | lr | 50 |
 | iTransformer | 2,592 | lr, dropout | 50 |
 | TimesNet | 2,916 | lr, dropout | 50 |
-| WFTNet | 7,776 | lr, dropout, period_coeff | 50 |
 | PatchTST | 15,552 | lr, dropout | 50 |
 | AdaWaveNet | 15,552 | lr, dropout, regu_details, regu_approx | 50 |
 | ModernTCN | 31,104 | lr, dropout, head_dropout | 50 |
@@ -310,7 +297,7 @@ the benchmark table — a single run sits closer to a best case than to a mean.
 
 Order of cost per trial (cheapest first): FITS ≈ DLinear ≪ TSLANet <
 PatchTST ≈ iTransformer ≈ ModernTCN < TimeMixer ≈ AdaWaveNet < MSGNet <
-WFTNet ≈ TimesNet.
+TimesNet.
 
 ## 5. Driver behaviour worth knowing
 
@@ -333,8 +320,8 @@ WFTNet ≈ TimesNet.
   configuration still costs about one training, not three.
 * **Failures are pruned, not fatal** — a config that hits a shape or assertion
   error is recorded (`trial.user_attrs['error']`) and pruned so the study
-  continues. All eleven spaces were validated by building and forward-passing
-  40 sampled configurations each (440 total) — none currently fail — so a
+  continues. All ten spaces were validated by building and forward-passing
+  40 sampled configurations each (400 total) — none currently fail — so a
   populated `error` attribute means something changed in `models/`.
 * **Disk** — trial checkpoints go to `tuning/results/_checkpoints/` and are
   deleted after each trial. `tuning/results/` is already git-ignored.
@@ -350,7 +337,7 @@ WFTNet ≈ TimesNet.
 `tuning/colab_tune.ipynb` — click the badge, or File → Open notebook → GitHub →
 `Mr0022/ProjectC`. The repo is public, so no credentials are involved. It
 mounts Drive, clones the repo, installs the handful of packages Colab lacks
-(`ptwt`, `fast_pytorch_kmeans`, `reformer-pytorch`, `local-attention`,
+(`fast_pytorch_kmeans`, `reformer-pytorch`, `local-attention`,
 `optuna`), runs the 50-trial × 3-seed search per model, then the `--itr 5`
 final runs, and prints a ranked summary table.
 

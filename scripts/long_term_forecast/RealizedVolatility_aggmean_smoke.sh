@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# Multi-horizon MEAN-AGGREGATION (Option 1) smoke test, all 11 models.
+# Multi-horizon MEAN-AGGREGATION (Option 1) smoke test, all 10 models.
 #
 # With --aggregate_mean the model forecasts a SINGLE value: the log of the
 # horizon-average variance, log(mean(RV)) over the next pred_len days
@@ -35,7 +35,6 @@ run_one TimesNet
 run_one MSGNet
 run_one TimeMixer --down_sampling_layers 3 --down_sampling_window 2 --down_sampling_method avg
 run_one FITS
-run_one WFTNet --e_layers 1
 run_one TSLANet
 run_one ModernTCN
 run_one AdaWaveNet --lifting_levels 3 --lifting_kernel_size 7 --n_clusters 4

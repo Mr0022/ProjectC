@@ -1,4 +1,4 @@
-"""Optuna driver for the eleven long-term forecasters.
+"""Optuna driver for the ten long-term forecasters.
 
     python tuning/optuna_tune.py --model DLinear --n_trials 50
     python tuning/optuna_tune.py --model all --n_trials 50 --train_epochs 30
@@ -37,7 +37,7 @@ import torch
 import run as run_module
 from tuning.search_spaces import FIXED_PROTOCOL, MODELS, suggest
 
-# The eleven models all live under long-term forecasting.
+# The ten models all live under long-term forecasting.
 TASK = 'long_term_forecast'
 
 

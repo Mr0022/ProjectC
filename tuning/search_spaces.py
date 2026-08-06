@@ -1,10 +1,10 @@
-"""Optuna search spaces for the eleven long-term forecasters under models/.
+"""Optuna search spaces for the ten long-term forecasters under models/.
 
 The protocol is fixed by the study and is NOT searched:
 
     seq_len   = 96      look-back window (business days)
     pred_len  = 1       one-step-ahead forecast
-    label_len = 48      decoder start token; none of the eleven models has a
+    label_len = 48      decoder start token; none of the ten models has a
                         real decoder, so it only sizes the (unused) dec_inp
 
 so every space below describes what varies AROUND that protocol: the model's
@@ -48,7 +48,7 @@ FIXED_PROTOCOL = {
     'label_len': 48,
 }
 
-# The eleven models, in the order the smoke scripts run them.
+# The ten models, in the order the smoke scripts run them.
 MODELS = (
     'DLinear',
     'PatchTST',
@@ -57,7 +57,6 @@ MODELS = (
     'MSGNet',
     'TimeMixer',
     'FITS',
-    'WFTNet',
     'TSLANet',
     'ModernTCN',
     'AdaWaveNet',
@@ -68,7 +67,7 @@ MODELS = (
 # Shared blocks
 # ---------------------------------------------------------------------------
 def _optimisation(trial):
-    """Settings every model shares -- IDENTICAL for all eleven.
+    """Settings every model shares -- IDENTICAL for all ten.
 
     Every model gets the same optimiser budget, so a benchmark table compares
     architectures rather than how generously each one was tuned. That means
@@ -213,7 +212,7 @@ def itransformer(trial):
 def timesnet(trial):
     """Cost grows as e_layers * top_k * num_kernels * d_model * d_ff, so the
     ranges are the tightest of the whole file -- this is by far the slowest of
-    the eleven.
+    the ten.
 
     top_k is the number of dominant periods pulled out of the rFFT of the
     (seq_len + pred_len) = 97-step series and reshaped into 2-D. Beyond ~5 the
@@ -356,40 +355,7 @@ def fits(trial):
 
 
 # ---------------------------------------------------------------------------
-# 8. WFTNet -- wavelet (local) + Fourier (global) branches
-# ---------------------------------------------------------------------------
-def wftnet(trial):
-    """Same Inception backbone as TimesNet plus a CWT branch, hence the same
-    tight capacity ranges and e_layers capped at 2 (the shipped smoke script
-    runs it at 1).
-
-    period_coeff is the weight between the two branches and is the knob worth
-    spending trials on: it says how much of the signal is treated as globally
-    periodic (Fourier) versus locally bursty (wavelet). Volatility is mostly
-    the latter -- clustered bursts -- so do not be surprised if the optimum
-    lands well below 0.5.
-
-    wavelet_scale is the exponent range of the Morlet scales, which are laid
-    out as 2**linspace(-1, scale, 8): scale 3 spans ~0.7-8 days, scale 6 spans
-    ~0.7-64 days, i.e. up to a quarter. Eight scales are hard-wired by the
-    (8, 1) scale convolution, so only their span is tunable.
-    """
-    d_model = trial.suggest_categorical('d_model', [16, 32, 64])
-    return {
-        'd_model': d_model,
-        'd_ff': _d_ff(trial, d_model),
-        'e_layers': trial.suggest_categorical('e_layers', [1, 2]),
-        'top_k': trial.suggest_categorical('top_k', [2, 3, 5]),
-        'num_kernels': trial.suggest_categorical('num_kernels', [3, 4, 6]),
-        'wavelet_scale': trial.suggest_categorical('wavelet_scale', [3, 4, 5, 6]),
-        'period_coeff': trial.suggest_float('period_coeff', 0.1, 0.9),
-        'dropout': trial.suggest_float('dropout', 0.0, 0.3),
-        **_optimisation(trial),
-    }
-
-
-# ---------------------------------------------------------------------------
-# 9. TSLANet -- adaptive spectral block over patches
+# 8. TSLANet -- adaptive spectral block over patches
 # ---------------------------------------------------------------------------
 def tslanet(trial):
     """Four knobs, because TSLANet reads exactly four config fields.
@@ -415,7 +381,7 @@ def tslanet(trial):
 
 
 # ---------------------------------------------------------------------------
-# 10. ModernTCN -- large-kernel depth-wise convolutions over patches
+# 9. ModernTCN -- large-kernel depth-wise convolutions over patches
 # ---------------------------------------------------------------------------
 def moderntcn(trial):
     """Large kernels are the whole point of the model, so they lead the space.
@@ -463,7 +429,7 @@ def moderntcn(trial):
 
 
 # ---------------------------------------------------------------------------
-# 11. AdaWaveNet -- learned lifting-scheme wavelet + transformer encoder
+# 10. AdaWaveNet -- learned lifting-scheme wavelet + transformer encoder
 # ---------------------------------------------------------------------------
 def adawavenet(trial):
     """The lifting depth is the knob that reshapes the model.
@@ -512,7 +478,6 @@ SPACES = {
     'MSGNet': msgnet,
     'TimeMixer': timemixer,
     'FITS': fits,
-    'WFTNet': wftnet,
     'TSLANet': tslanet,
     'ModernTCN': moderntcn,
     'AdaWaveNet': adawavenet,

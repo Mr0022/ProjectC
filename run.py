@@ -250,11 +250,6 @@ def build_parser():
     parser.add_argument('--cut_freq', type=int, default=0,
                         help='FITS low-pass cutoff (num of retained freq bins); 0 = auto')
 
-    # WFTNet
-    parser.add_argument('--wavelet_scale', type=int, default=4, help='WFTNet CWT scale')
-    parser.add_argument('--period_coeff', type=float, default=0.5,
-                        help='WFTNet weight balancing wavelet vs fourier branch')
-
     # AdaWaveNet (adaptive lifting-scheme wavelet network)
     parser.add_argument('--lifting_kernel_size', type=int, default=7, help='conv kernel size of lifting scheme')
     parser.add_argument('--lifting_levels', type=int, default=1, help='levels of lifting scheme')
