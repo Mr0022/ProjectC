@@ -19,6 +19,13 @@ HAR-RV is OLS and has no hyperparameters to tune, so a held-out validation set
 would serve no purpose there. It folds the validation months back into the
 estimation sample (see `har_bounds`) and keeps the TEST window identical, which
 is what makes the two families' out-of-sample losses comparable.
+
+Every window is embargoed at its edges: a forecast whose target spans h rows is
+admitted only when all h of them fall inside the window (`horizon_month_mask`).
+Without that the last h-1 rows of the training sample carry targets averaging
+data from the far side of the boundary -- test data, at the train|test seam. The
+sequence models already enumerate their windows this way and cannot straddle a
+border; HAR-RV selects rows by date, so it applies the mask explicitly.
 """
 
 from collections import namedtuple
@@ -69,6 +76,9 @@ def month_mask(dates, lo=None, hi=None):
 
     Both bounds are inclusive (year, month) pairs; None means unbounded on that
     side. Used by HAR-RV, which selects rows by date rather than by row index.
+
+    This masks on the row's OWN date. A row-indexed direct forecast whose target
+    spans several rows needs `horizon_month_mask` below instead.
     """
     months = month_ordinal(dates)
     mask = pd.Series(True, index=months.index)
@@ -77,6 +87,47 @@ def month_mask(dates, lo=None, hi=None):
     if hi is not None:
         mask &= months <= to_ordinal(hi)
     return mask.values
+
+
+def horizon_month_mask(dates, h, lo=None, hi=None):
+    """`month_mask` with the split-boundary embargo applied: rows whose ENTIRE
+    h-row target window lies inside [lo, hi].
+
+    A direct h-day forecast indexed at row t carries a target spanning rows
+    t .. t+h-1. Selecting on t alone therefore admits the last h-1 rows of the
+    window, whose targets read past the boundary -- at the train|test seam that
+    is h-1 training labels averaging test-period data. Requiring the row where
+    the target CLOSES to be inside the window as well drops exactly those h-1
+    rows, and nothing else.
+
+    The same rule trims the far edge: with `hi` open, or a sample that stops
+    before `hi`, the last h-1 rows have no complete forward window and are
+    excluded. That keeps a window's row count at (rows in window) - h + 1
+    whether the sample ends inside the window or runs past it -- so appending
+    data to a CSV cannot change what an already-bounded window covers.
+
+    The sequence models get this for free. Dataset_Custom slices its split and
+    enumerates windows as len - seq_len - pred_len + 1, so a target can never
+    reach past border2: the h-1 straddling windows are simply never indexed.
+    This function is that same guarantee written out for a row-indexed
+    regression, which has no window enumeration to hide it in.
+
+    Counting is POSITIONAL, because a target window spans h ROWS of the series
+    (trading days), not h calendar days. `dates` must therefore be the complete,
+    gap-free row grid -- pass it BEFORE any trailing NaN drop, or the h-1
+    lookahead lands on the wrong row and the embargo silently misfires.
+
+    h <= 1 has no forward window, so the mask is returned unchanged.
+    """
+    inside = month_mask(dates, lo, hi)
+    if h <= 1:
+        return inside
+    n, k = len(inside), h - 1
+    closes = np.zeros(n, dtype=bool)
+    if k < n:
+        # closes[i] = "the row this target ends on is in the window too"
+        closes[:n - k] = inside[k:]
+    return inside & closes
 
 
 # ==============================================================================

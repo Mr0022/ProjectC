@@ -27,6 +27,19 @@ The TEST window is identical to the deep models', so out-of-sample losses
 remain directly comparable. Note the deep models never fit on the validation
 months; they only use them for early stopping / model selection.
 
+Windows are EMBARGOED at their edges. Y^(h) at row t averages rows t..t+h-1, so
+assigning rows to a split on their own date alone would put h-1 rows (21 at
+h=22) in the training sample whose targets average test-period RV, and would
+peg the test row count to wherever the CSV happens to stop rather than to the
+test boundary. horizon_month_mask in splits.py admits a row only when its whole
+target window falls inside the window, which drops exactly those h-1 rows at
+each edge. The deep models get this free -- Dataset_* enumerates windows as
+len - seq_len - pred_len + 1 inside an already-sliced split, so a target can
+never cross a border there -- and with the embargo both families report
+(rows in window) - h + 1 forecasts on identical rows. --no-embargo restores the
+usual unembargoed HAR convention for measuring what the leak was worth; it is
+not a fair benchmark against the deep models.
+
 --asset defaults to forex and is NOT inferred from the filename: running a
 crypto CSV without --asset crypto silently trains on the wrong window, so the
 calendar in force is printed at the top of every run and on every figure.
@@ -249,7 +262,8 @@ from   scipy                               import stats
 # splits.py is deliberately pandas/numpy only, so importing it here does not
 # drag torch or sklearn into a HAR-RV run.
 from   data_provider.splits import (SPLITS, har_bounds, month_mask, fmt_month,
-                                    month_of, next_month, to_ordinal)
+                                    horizon_month_mask, month_of, next_month,
+                                    to_ordinal)
 
 
 # ==============================================================================
@@ -276,6 +290,14 @@ TRAIN_START = None
 TRAIN_END   = None
 TEST_START  = None
 TEST_END    = None
+
+# Embargo the h-1 rows at each window edge whose h-day target would close on the
+# far side of the boundary (horizon_month_mask in splits.py). ON by default: at
+# the train|test seam those rows are training labels built from test data, and
+# the deep models' window enumeration already excludes their equivalent. Turn it
+# off with --no-embargo to reproduce the unembargoed numbers and measure what
+# the leak was worth on a given sample.
+EMBARGO = True
 
 # Forecast horizons. 'overlap_lag' = 2*(h-1) is the MA(h-1) floor induced by
 # the overlapping h-day target; 'nw_lag' is the bandwidth actually used and is
@@ -462,6 +484,16 @@ def parse_args(argv=None):
         "--qlike-floor-frac", type=float, default=QLIKE_FLOOR_FRAC, metavar="FRAC",
         help="Non-positive forecasts are floored at FRAC * mean(training RV) "
              "before QLIKE is evaluated.")
+    p.add_argument(
+        "--no-embargo", dest="embargo", action="store_false", default=EMBARGO,
+        help="Assign rows to a split on their own date only, the usual HAR "
+             "convention. The h-day target spans t..t+h-1, so this puts h-1 "
+             "training rows (21 at h=22) in the sample whose targets average "
+             "test-period RV, and makes the test row count depend on where the "
+             "CSV stops rather than on --test-end. Default is to embargo those "
+             "rows, which is what the deep models' window enumeration does and "
+             "what keeps the two families' row counts equal. Use this only to "
+             "measure what the leak is worth, not to report a benchmark.")
     p.add_argument(
         "--nw-lag-rule", choices=["auto", "overlap"], default=NW_LAG_RULE,
         help="Newey-West bandwidth. 'auto' = max(2*(h-1), Newey-West 1994 "
@@ -759,6 +791,10 @@ def build_horizon_target(df_base: pd.DataFrame, h: int) -> pd.DataFrame:
     t-1 while the target covers the next h days -- a genuine forecast with
     no look-ahead, indexed one day earlier than the formula above.
 
+    That forward reach is why rows cannot be assigned to a split on their own
+    date alone: split_by_calendar embargoes the h-1 rows at each window edge
+    whose target would close outside the window.
+
     Using the h-day SUM instead would multiply Y, all coefficients and all
     residuals by h (MSE by h^2) on the raw scale; on the log scale it would
     shift Y by the constant ln(h), which the intercept absorbs. R^2 is
@@ -773,16 +809,22 @@ def build_horizon_target(df_base: pd.DataFrame, h: int) -> pd.DataFrame:
     else:
         fwd = df["RV_raw"].rolling(h).mean().shift(-(h - 1))
         df["Y_h"] = np.log(fwd) if LOG_MODE else fwd
-    return df.dropna(subset=["Y_h", "RV_d", "RV_w", "RV_m"])
+    # Only the leading warm-up rows are dropped here. The trailing rows, where
+    # the forward window runs off the end of the sample and Y_h is NaN, stay in
+    # place so the frame remains a gap-free row grid: split_by_calendar has to
+    # look h-1 rows AHEAD of each candidate origin to apply the embargo, and it
+    # cannot do that on a frame whose tail has already been cut away. It drops
+    # them itself, along with the rest of the far-edge embargo.
+    return df.dropna(subset=["RV_d", "RV_w", "RV_m"])
 
 
 # ==============================================================================
 # 3.  CALENDAR TRAIN / TEST SPLIT   (bounds shared with the deep models)
 # ==============================================================================
 
-def split_by_calendar(df: pd.DataFrame,
+def split_by_calendar(df: pd.DataFrame, h: int,
                       train_start=None, train_end=None,
-                      test_start=None, test_end=None):
+                      test_start=None, test_end=None, embargo=None):
     """
     Chronological split on the same calendar the deep models use, with the
     validation months folded into training (see har_bounds in splits.py).
@@ -793,14 +835,51 @@ def split_by_calendar(df: pd.DataFrame,
     available to the rolling windows that built RV_d/RV_w/RV_m, so a bounded
     training sample keeps a full 22-day look-back at its first row instead of
     losing a month to NaNs.
+
+    `df` must arrive as the gap-free row grid build_horizon_target returns --
+    trailing NaN targets included -- because the embargo counts h-1 rows ahead
+    of each candidate origin.
+
+    THE EMBARGO. Y_h at row t averages rows t .. t+h-1, so a row selected on its
+    own date can carry a target reaching h-1 rows past the window it was put in.
+    `horizon_month_mask` admits a row only when its target closes inside the same
+    window, which trims h-1 rows from each edge and fixes two things at once:
+
+      train|test seam -- without it the last h-1 TRAINING rows carry targets
+          averaging test-period RV, so the estimated coefficients are a function
+          of the data they are then scored on. 21 rows at h=22.
+      far edge of the test window -- without it the test row count depends on
+          where the CSV happens to stop rather than on `test_end`. That is
+          invisible while a file ends exactly at its boundary (every file here
+          does today) and silently adds h-1 rows the moment one runs past it,
+          which would score HAR on rows the deep models never see.
+
+    Both leave the deep models untouched: Dataset_Custom enumerates windows as
+    len - seq_len - pred_len + 1 within an already-sliced split, so neither case
+    can arise there. The embargo is what puts HAR-RV under the same rule, and
+    with it both families report (rows in window) - h + 1 forecasts.
+
+    `embargo=False` (--no-embargo) restores the unembargoed selection, which is
+    the standard HAR convention in the literature and useful for quantifying
+    what the boundary leak is worth on a given sample. It is not a fair
+    benchmark against the deep models: it hands HAR h-1 extra training rows the
+    deep models are denied, and those rows have seen the test period.
     """
     train_start = TRAIN_START if train_start is None else train_start
     train_end   = TRAIN_END   if train_end   is None else train_end
     test_start  = TEST_START  if test_start  is None else test_start
     test_end    = TEST_END    if test_end    is None else test_end
+    embargo     = EMBARGO     if embargo     is None else embargo
 
-    train = df[month_mask(df.index, train_start, train_end)].copy()
-    test  = df[month_mask(df.index, test_start,  test_end)].copy()
+    def select(lo, hi):
+        if embargo:
+            return horizon_month_mask(df.index, h, lo, hi)
+        return month_mask(df.index, lo, hi)
+
+    # The embargo already implies a complete forward window, so this dropna is
+    # a no-op under it; it is what removes the unusable tail when it is off.
+    train = df[select(train_start, train_end)].dropna(subset=["Y_h"]).copy()
+    test  = df[select(test_start,  test_end)].dropna(subset=["Y_h"]).copy()
 
     if len(train) == 0:
         raise ValueError(
@@ -1064,6 +1143,23 @@ def print_split_info(train: pd.DataFrame, test: pd.DataFrame, h: int):
           f"{str(test.index[0].date()):>12}  {str(test.index[-1].date()):>12}  "
           f"{TEST_LABEL}")
     print(f"  {THIN[:64]}")
+    if not EMBARGO:
+        print(f"  ! --no-embargo: the last {h - 1} training row(s) carry targets "
+              f"that average")
+        print(f"    test-period RV, and the test row count follows where the file "
+              f"ends rather")
+        print(f"    than --test-end. Not comparable to the deep models.")
+    elif h == 1:
+        print(f"  Embargo: nothing to drop at h=1 -- the target is the row "
+              f"itself.")
+    else:
+        print(f"  Embargo: {h - 1} row(s) trimmed from each window edge, the "
+              f"origins whose")
+        print(f"           {h}-day target would close past the boundary. Each "
+              f"window keeps")
+        print(f"           (its rows) - {h} + 1, which is exactly what "
+              f"Dataset_{ASSET.capitalize()}")
+        print(f"           enumerates for pred_len={h}.")
     print(f"  Note: OLS has no hyperparameters, so the deep models' validation")
     print(f"        months are folded into training. Test window is identical")
     print(f"        to the DL models' for a like-for-like comparison.\n")
@@ -1476,13 +1572,14 @@ def main(argv=None):
 
     global DATA_FILE, OUT_DIR, ASSET
     global TRAIN_START, TRAIN_END, TEST_START, TEST_END
-    global QLIKE_FLOOR_FRAC, NW_LAG_RULE, LOG_MODE
+    global QLIKE_FLOOR_FRAC, NW_LAG_RULE, LOG_MODE, EMBARGO
     DATA_FILE        = resolve_data_path(args.data)
     OUT_DIR          = args.outdir
     ASSET            = args.asset
     QLIKE_FLOOR_FRAC = args.qlike_floor_frac
     NW_LAG_RULE      = args.nw_lag_rule
     LOG_MODE         = args.log
+    EMBARGO          = args.embargo
     (TRAIN_START, TRAIN_END,
      TEST_START, TEST_END) = resolve_split(args)
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -1539,7 +1636,7 @@ def main(argv=None):
         print(f"{'-'*72}")
 
         df_h        = build_horizon_target(df_base, h)
-        train, test = split_by_calendar(df_h)
+        train, test = split_by_calendar(df_h, h)
         print_split_info(train, test, h)
 
         result = fit_har_rv(train, h)
@@ -1674,6 +1771,9 @@ def main(argv=None):
     hyperparameters, so its validation months are folded into the estimation
     sample; the test window is shared, which is what keeps the out-of-sample
     losses comparable. Run the deep models with --data {ASSET} to match.
+    Each window is embargoed by h-1 rows at its edges, so no training target
+    averages test-period data and both families score (window rows) - h + 1
+    forecasts. --no-embargo restores the unembargoed convention.
 
   References:
     Corsi, F. (2009). A simple approximate long-memory model of realized
