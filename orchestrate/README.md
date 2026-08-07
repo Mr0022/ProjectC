@@ -41,12 +41,22 @@ Forecasts per test window, after the h−1 embargo at each edge:
 
 ## 2. The protocol (identical for every cell)
 
-Every deep-model cell runs under the flags the tuning study used:
+Every deep-model cell runs under the flags the tuning study used, at a fixed
+training budget:
 
 ```
 --aggregate_mean --features S --target RV --seq_len 96 --label_len 48
---train_epochs 30 --patience 7
+--train_epochs 50 --patience 10
 ```
+
+The budget is the one part of the protocol the orchestrator sets itself rather
+than inheriting: `train_epochs` and `patience` are in `ORCHESTRATOR_FLAGS`, so
+whatever an anchor's tuned command line said about them is dropped and these
+values are used instead. The tuning study searched at 30 / 7, so anchors are
+being reused at a longer budget than they were selected under — deliberate, but
+worth stating, and worth re-tuning if the budget moves again. Note also that
+`--lradj cosine` anchors divide by `train_epochs` to shape the learning-rate
+schedule, so for those the cap is not merely a stopping point.
 
 so the model emits **one** number per window — the mean of RV over the next h
 days — which is exactly HAR-RV's target `Y^(h)`. HAR-RV is fitted by
@@ -240,7 +250,7 @@ A DM statistic computed across misaligned rows looks perfectly healthy. So:
 
 ## 7. Cost, resuming and failures
 
-300 trainings of up to 30 epochs. On a T4 the cheap models (FITS, DLinear,
+300 trainings of up to 50 epochs. On a T4 the cheap models (FITS, DLinear,
 TSLANet) are seconds each and TimesNet/MSGNet dominate; the whole grid is an
 overnight job. On CPU it is only realistic as a smoke test — use `--quick`
 (5 epochs, patience 3) and `--limit`.

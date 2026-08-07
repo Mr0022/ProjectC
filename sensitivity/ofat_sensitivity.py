@@ -441,8 +441,11 @@ def main():
                          'three is the affordable minimum')
     ap.add_argument('--seed', type=int, default=2021,
                     help='base seed; repeat i uses --seed + i')
-    ap.add_argument('--train_epochs', type=int, default=30)
-    ap.add_argument('--patience', type=int, default=7)
+    # Kept in step with DEFAULT_TRAIN_EPOCHS/DEFAULT_PATIENCE in
+    # orchestrate/benchmark_config.py: an OFAT curve is only readable next to
+    # the benchmark table if both were measured under the same budget.
+    ap.add_argument('--train_epochs', type=int, default=50)
+    ap.add_argument('--patience', type=int, default=10)
     ap.add_argument('--checkpoint_dir', default='./checkpoints/ofat',
                     help='where a point writes its per-epoch checkpoints. They '
                          'are deleted after the point unless --keep_checkpoints, '

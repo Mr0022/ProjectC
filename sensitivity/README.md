@@ -162,7 +162,7 @@ So the same sweep can be read on the criterion the search optimised
 
 ## 6. Cost, resuming, failures
 
-At `--itr 5` and 30 epochs the full sweep is ~1 215 trainings — the same order
+At `--itr 5` and 50 epochs the full sweep is ~1 215 trainings — the same order
 as the tuning study itself (50 trials × 3 seeds per model). On a T4:
 DLinear/FITS are minutes, PatchTST/TSLANet/iTransformer/ModernTCN/AdaWaveNet/
 TimeMixer are a few hours each, MSGNet the better part of a day. Plan on more

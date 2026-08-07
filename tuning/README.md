@@ -35,6 +35,15 @@ are reported on resume so the count is not a mystery.
 | repeats per trial | **3** (`--n_seeds`, alias `--itr`) | each configuration is trained 3× (seeds 2021–2023) and scored by the **mean** |
 | loss / selection | MSE on validation | test split is never read during a study |
 
+> **The 30 / 7 above is a record of what this study ran at, not the benchmark's
+> budget.** The benchmark and the OFAT sweep now train at `50 / 10`
+> (`DEFAULT_TRAIN_EPOCHS` / `DEFAULT_PATIENCE` in
+> `orchestrate/benchmark_config.py`), which they set themselves rather than
+> reading from an anchor. The tuned parameters in `ProjectC_tuning/*_best.json`
+> — learning rate, batch size, `lradj` — were therefore selected under a
+> shorter budget than the one they are evaluated at. Re-run the study at the
+> benchmark budget if that gap needs closing.
+
 With `--aggregate_mean` (on by default in the driver) at `h = 1` the target is
 `Y^(1) = RV_{t+1}`, i.e. the HAR-RV target at horizon 1, and the loss is
 computed on the `ln(RV)` scale rather than in z-space — so the validation

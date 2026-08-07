@@ -102,8 +102,22 @@ DEFAULT_SEED = 2021
 # so a single run reports a draw rather than a model. Seeds follow run.py's
 # rule -- repeat i uses (--seed + i) -- so 10 x DEFAULT_SEED means 2021..2030.
 DEFAULT_N_SEEDS = 10
-DEFAULT_TRAIN_EPOCHS = 30
-DEFAULT_PATIENCE = 7
+# The training budget. Early stopping, not the epoch cap, is what actually ends
+# a cell: patience counts consecutive epochs without a validation improvement
+# and the checkpoint kept is the best-validation one, so the cap only binds on a
+# run that never stops improving. Ten lets a configuration sit flat for several
+# epochs and still recover, which happens on splits this noisy.
+#
+# The cap is NOT inert for every cell, though: under `--lradj cosine` run.py
+# divides by train_epochs to shape the schedule (see adjust_learning_rate in
+# utils/tools.py), so changing it changes the whole learning-rate trajectory
+# rather than just the stopping point. Under `--lradj type1` -- what most tuned
+# anchors use -- the rate halves every epoch and collapses long before the cap,
+# so there the cap is close to decorative. Anchors tuned at one budget are being
+# reused at this one; that is deliberate, but it is why the two numbers should
+# move together with a re-tune rather than be nudged in isolation.
+DEFAULT_TRAIN_EPOCHS = 50
+DEFAULT_PATIENCE = 10
 
 # Same fraction HAR-RV_RUN.PY and Exp_Long_Term_Forecast use. Under --log every
 # forecast is exp(.) > 0, so the floor never binds; it is applied anyway so the
