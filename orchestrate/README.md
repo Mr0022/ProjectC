@@ -281,15 +281,26 @@ session is resumed by re-running the setup cells and the sweep cell.
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Mr0022/ProjectC/blob/claude/benchmark-raw-rv-7ef3kb/orchestrate/colab_benchmark_raw.ipynb)
 
 `orchestrate/colab_benchmark_raw.ipynb` — the same grid on the **raw variance
-scale**. The shipped anchors all carry `--log`, and the scale is a property of
-the anchor, so a raw sweep needs anchors of its own: the notebook re-runs the
-Optuna study with `--raw` under the identical protocol (same spaces, 50 trials,
-3 repeats per trial, EUR/USD at h = 1), then runs the benchmark against those
-with `--anchor_dir` and `--scale raw_RV`. It also counts the non-positive
-forecasts only the raw scale can produce (`n_floored` in `metrics.csv`, which
-is identically zero under `--log`) and sets the raw table against the `ln(RV)`
-one on the three metrics they share — `QLIKE`, `MSE_RV`, `MAE_RV`. Keep its
-Drive directories separate from the log run's; one scale per sweep.
+scale**, with the **existing Optuna winners reused unchanged**. The scale is a
+property of the anchor, so the notebook copies each
+`tuning/ProjectC_tuning/<Model>_best.json` with the single token `--log`
+deleted from its command line and runs the sweep against those
+(`--anchor_dir`, `--scale raw_RV`). Nothing is re-tuned: `--log` is not in
+`ORCHESTRATOR_FLAGS`, so removing it there is both necessary and sufficient,
+and every hyper-parameter passes through verbatim. The two sweeps then differ
+in one variable, which is what makes the notebook's raw-vs-log join meaningful
+— on `QLIKE`, `MSE_RV` and `MAE_RV`, the three metrics the scales share.
+
+Worth stating wherever those tables are reported: the hyper-parameters were
+selected by minimising a validation loss on `ln(RV)`, so a model that reads
+badly on the raw scale may be mistuned for it rather than unsuited to it. The
+notebook counts the non-positive forecasts only the raw scale can produce
+(`n_floored` in `metrics.csv`, identically zero under `--log`), which is where
+that tends to show. Re-tuning under `--raw` is one flag —
+`tuning/optuna_tune.py --model <M> --raw --out_dir <dir>` — if the question
+becomes "the best each architecture can do on raw RV" rather than "what the
+scale changes". Keep the Drive directories separate from the log run's; one
+scale per sweep.
 
 ## 9. Two changes this made to `exp/exp_long_term_forecasting.py`
 
