@@ -278,6 +278,19 @@ what Colab lacks, runs the sweep with `--results_dir` on Drive and
 `--checkpoint_dir` on local disk, and prints the summary tables. A disconnected
 session is resumed by re-running the setup cells and the sweep cell.
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Mr0022/ProjectC/blob/claude/benchmark-raw-rv-7ef3kb/orchestrate/colab_benchmark_raw.ipynb)
+
+`orchestrate/colab_benchmark_raw.ipynb` — the same grid on the **raw variance
+scale**. The shipped anchors all carry `--log`, and the scale is a property of
+the anchor, so a raw sweep needs anchors of its own: the notebook re-runs the
+Optuna study with `--raw` under the identical protocol (same spaces, 50 trials,
+3 repeats per trial, EUR/USD at h = 1), then runs the benchmark against those
+with `--anchor_dir` and `--scale raw_RV`. It also counts the non-positive
+forecasts only the raw scale can produce (`n_floored` in `metrics.csv`, which
+is identically zero under `--log`) and sets the raw table against the `ln(RV)`
+one on the three metrics they share — `QLIKE`, `MSE_RV`, `MAE_RV`. Keep its
+Drive directories separate from the log run's; one scale per sweep.
+
 ## 9. Two changes this made to `exp/exp_long_term_forecasting.py`
 
 Both are in the `--log` branch of `_report_rv_metrics`, i.e. they affect what
